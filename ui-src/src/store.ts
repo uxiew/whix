@@ -7,8 +7,10 @@
 // hot-swapped modules, devtools timelines) never comes up in a single window
 // with five panes.
 
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, reactive, ref, shallowRef, watch } from 'vue';
 import { api } from './api';
+import type { ImportInput } from './api';
+import { classifyImport } from './import-file';
 // The filter grammar, imported for its side effect: the module is plain
 // script-shaped JavaScript with no exports, because the same file is evaluated
 // by a Rust test in the engine the proxy already carries. One copy, so the
@@ -995,6 +997,9 @@ async function revealComposed(sent: Composition, url: string, after: number): Pr
 const ruleDrafts = createDrafts<string>();
 const valueDrafts = createDrafts<string | null>();
 export const rulesEditor = computed(() => ruleDrafts.get(state.group));
+export const ruleManagementBusy = ref(false);
+export const namedGroups = computed(() => state.groups.filter((g) => g.name !== 'default'));
+export const namedGroupIndex = computed(() => namedGroups.value.findIndex((g) => g.name === state.group));
 export const valuesEditor = computed(() => valueDrafts.get(state.valueKey));
 // Whole-store and per-key saves write the same Values store; do not race them.
 export const valuesSaving = computed(() => [...valueDrafts.entries.values()].some((d) => d.saving));
@@ -1031,6 +1036,7 @@ export async function selectGroup(name: string): Promise<void> {
 }
 
 export async function saveRules(): Promise<void> {
+  if (ruleManagementBusy.value) return;
   const name = state.group;
   const saved = await saveDraft(ruleDrafts.get(name), async (text) => {
     if (name === 'default') {
@@ -1050,6 +1056,7 @@ export async function saveRules(): Promise<void> {
 }
 
 export async function addGroup(): Promise<void> {
+  if (ruleManagementBusy.value) return;
   const name = prompt('Group name:');
   if (!name || !name.trim()) return;
   const res = await api.addRuleGroup(name.trim());
@@ -1062,11 +1069,13 @@ export async function addGroup(): Promise<void> {
 }
 
 export async function toggleGroup(name: string): Promise<void> {
+  if (ruleManagementBusy.value) return;
   await api.toggleRuleGroup(name);
   await loadRules();
 }
 
 export async function deleteGroup(name: string): Promise<void> {
+  if (ruleManagementBusy.value) return;
   if (ruleDrafts.get(name).saving) return;
   if (!confirm(`Delete group "${name}"?`)) return;
   const res = await api.deleteRuleGroup(name);
@@ -1077,6 +1086,43 @@ export async function deleteGroup(name: string): Promise<void> {
   if (state.group === name) state.group = 'default';
   ruleDrafts.remove(name);
   await loadRules();
+}
+
+export async function renameGroup(name: string): Promise<void> {
+  if (name === 'default' || ruleManagementBusy.value || ruleDrafts.get(name).saving) return;
+  const to = prompt('Rename group to:', name)?.trim();
+  if (!to || to === name) return;
+  if (state.groups.some((g) => g.name === to) || (ruleDrafts.entries.has(to) && ruleDirty(to))) {
+    alert('A group or unsaved draft by that name already exists');
+    return;
+  }
+  ruleManagementBusy.value = true;
+  rulesLoadVersion++;
+  try {
+    const result = await api.renameRuleGroup(name, to);
+    if (!result.ok) throw new Error(result.error || 'Rename failed');
+    ruleDrafts.rename(name, to);
+    if (state.group === name) state.group = to;
+    await loadRules();
+  } catch (error) { alert(error instanceof Error ? error.message : 'Rename failed'); }
+  finally { ruleManagementBusy.value = false; }
+}
+
+export async function moveGroup(direction: -1 | 1): Promise<void> {
+  if (ruleManagementBusy.value || rulesEditor.value.saving) return;
+  const names = namedGroups.value.map((g) => g.name);
+  const from = names.indexOf(state.group);
+  const to = from + direction;
+  if (from < 0 || to < 0 || to >= names.length) return;
+  [names[from], names[to]] = [names[to], names[from]];
+  ruleManagementBusy.value = true;
+  rulesLoadVersion++;
+  try {
+    const result = await api.reorderRuleGroups(names);
+    if (!result.ok) throw new Error(result.error || 'Reorder failed; reload the group list');
+    await loadRules();
+  } catch (error) { alert(error instanceof Error ? error.message : 'Reorder failed'); }
+  finally { ruleManagementBusy.value = false; }
 }
 
 // ── values ─────────────────────────────────────────────────────────────────
@@ -1183,9 +1229,6 @@ export async function deleteValue(name: string): Promise<void> {
 
 // ── import / export ────────────────────────────────────────────────────────
 
-/** The marker the proxy writes into a bundle, and the only way one is known. */
-const BUNDLE_MARKER = 'whix';
-
 /** Hand `text` to the browser as a file, without leaving the page. */
 export function downloadText(name: string, text: string, type = 'text/plain'): void {
   const url = URL.createObjectURL(new Blob([text], { type }));
@@ -1207,84 +1250,27 @@ export function exportValues(): void {
   else downloadText(state.valueKey, valuesEditor.value.text);
 }
 
-/** The parsed object if `text` is an exported bundle, and `null` otherwise. */
-function asBundle(text: string): Record<string, unknown> | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    if (value && typeof value === 'object' && BUNDLE_MARKER in value) {
-      return value as Record<string, unknown>;
-    }
-  } catch {
-    // Not JSON at all, which is what a rules file is.
-  }
-  return null;
-}
+export const pendingImport = shallowRef<{ filename: string; input: ImportInput } | null>(null);
 
-/** A JSON object of strings — the shape a plain values export has. */
-function asValueStore(text: string): Record<string, string> | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    const entries = Object.entries(value);
-    if (!entries.length || !entries.every(([, v]) => typeof v === 'string')) return null;
-    return Object.fromEntries(entries) as Record<string, string>;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read a file back in.
- *
- * A bundle — recognised by its marker, never by guessing — restores the groups,
- * their switches and the values in one act. Anything else is the plain text it
- * looks like: a rules file becomes the group it is named after, a values export
- * becomes its keys, and any other file becomes one value.
- *
- * Which of the two a plain file lands in follows the pane it was imported from.
- * A rules group and a value are both just text, and nothing inside the file
- * tells them apart.
- */
+/** Capture the destination before reading the file; switching panes must not
+ * turn a rules export into Values (or vice versa). No writes before review. */
 export async function importFile(file: File): Promise<void> {
-  const text = await file.text();
-  const bundle = asBundle(text);
-  if (bundle) {
-    const res = await api.importBundle(bundle);
-    if (!res.ok) {
-      alert(res.error || 'Import failed');
-      return;
+  const pane = state.pane === 'rules' ? 'rules' : 'values';
+  try {
+    const text = await file.text();
+    if (ruleManagementBusy.value || valuesSaving.value || [...ruleDrafts.entries.values()].some((d) => d.saving)) {
+      throw new Error('Wait for pending saves before importing');
     }
-    const note = `Imported ${res.groups ?? 0} groups and ${res.values ?? 0} values`;
-    await loadRules();
-    await loadValues();
-    rulesEditor.value.status = note;
-    valuesEditor.value.status = note;
-    return;
-  }
+    pendingImport.value = { filename: file.name, input: classifyImport(text, file.name, pane) };
+  } catch (error) { alert(error instanceof Error ? error.message : 'Could not read the import file'); }
+}
 
-  const name = file.name.replace(/\.(rules|txt|json)$/i, '') || file.name;
-  if (state.pane === 'rules') {
-    // A group that already exists is updated rather than refused, so a file
-    // exported from here imports back over the group it came from.
-    const res = state.groups.some((g) => g.name === name)
-      ? await api.updateRuleGroup(name, text)
-      : await api.addRuleGroup(name, text);
-    if (!res.ok) {
-      alert(res.error || 'Import failed');
-      return;
-    }
-    state.group = name;
-    await loadRules();
-    rulesEditor.value.status = `Imported ${file.name}`;
-    return;
-  }
-
-  const store = asValueStore(text);
-  for (const [key, value] of Object.entries(store ?? { [name]: text })) {
-    await api.setValue(key, value);
-  }
-  await loadValues();
-  valuesEditor.value.status = `Imported ${file.name}`;
+export async function finishImport(groups: number, values: number): Promise<void> {
+  pendingImport.value = null;
+  await Promise.all([loadRules(), loadValues()]);
+  const note = `Imported ${groups} groups and ${values} values; unsaved drafts were kept`;
+  rulesEditor.value.status = note;
+  valuesEditor.value.status = note;
 }
 
 // ── status ─────────────────────────────────────────────────────────────────
@@ -1370,6 +1356,7 @@ export function showPane(name: Pane): void {
 
 /** ⌘S saves whichever pane is showing, and nothing else has one. */
 export function saveCurrentPane(): void {
+  if (pendingImport.value) return;
   if (state.pane === 'rules') void saveRules();
   else if (state.pane === 'values') void saveValue();
 }

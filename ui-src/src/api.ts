@@ -421,6 +421,25 @@ export interface PageLogs {
   last: number;
 }
 
+export interface ImportInput {
+  format: 'whistle-rules' | 'whistle-values' | 'whix' | 'rules-text' | 'value-text';
+  data: unknown;
+  name?: string;
+  enable_new?: boolean;
+  expected?: string;
+}
+
+export interface ImportPreview {
+  ok: boolean;
+  error?: string;
+  token: string;
+  groups: { name: string; enabled: boolean; replace: boolean }[];
+  values: { name: string; replace: boolean }[];
+  before: string[];
+  after: string[];
+  warnings: string[];
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
@@ -515,6 +534,10 @@ export const api = {
     postJson<OkResult>('/api/rule-groups', { name, text, enabled }),
   updateRuleGroup: (name: string, text: string) =>
     postJson<OkResult>('/api/rule-group/update', { name, text }),
+  renameRuleGroup: (name: string, to: string) => postJson<OkResult>('/api/rule-group/rename', { name, to }),
+  reorderRuleGroups: (names: string[]) => postJson<OkResult>('/api/rule-groups/reorder', { names }),
+  previewImport: (input: ImportInput) => postJson<ImportPreview>('/api/import/preview', input),
+  applyImport: (input: ImportInput) => postJson<OkResult & { groups: number; values: number }>('/api/import/apply', input),
   toggleRuleGroup: (name: string) =>
     postJson<OkResult & { enabled?: boolean }>('/api/rule-group/toggle', { name }),
   deleteRuleGroup: (name: string) => postJson<OkResult>('/api/rule-group', { name }, 'DELETE'),

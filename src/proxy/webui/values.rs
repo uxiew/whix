@@ -23,8 +23,15 @@ pub(super) async fn values_post(
     };
     match serde_json::from_slice::<std::collections::HashMap<String, String>>(&body) {
         Ok(map) => {
-            save_values(state, &map);
-            *state.values.write().unwrap() = map;
+            // Match per-key edits/imports: disk and memory change under one lock.
+            let mut values = state.values.write().unwrap();
+            if state.config.persist_edits
+                && let Err(error) =
+                    crate::rules::storage::try_save_values(state.config.data_dir(), &map)
+            {
+                return json_error(&format!("could not save values: {error}"));
+            }
+            *values = map;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")

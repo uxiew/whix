@@ -21,7 +21,22 @@ pub struct GroupsConfig {
     pub groups: Vec<GroupMeta>,
 }
 
-/// Sanitise a group name into a safe filename (no path traversal).
+// Keep the existing public metadata types constructible by library callers;
+// the on-disk extension is private to the storage reader/writer.
+#[derive(Serialize, Deserialize)]
+struct StoredGroup {
+    #[serde(flatten)]
+    group: GroupMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StoredGroups {
+    groups: Vec<StoredGroup>,
+}
+
+/// The old filename mapping, kept only for reading legacy metadata.
 fn safe_filename(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -83,9 +98,17 @@ fn read_store<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 
 /// Load all rule groups from `dir` into `manager`.
 pub fn load_groups(dir: &Path, manager: &mut RuleManager) {
-    let config: GroupsConfig = read_store(&dir.join("groups.json"));
-    for meta in &config.groups {
-        let file = dir.join(format!("{}.rules", safe_filename(&meta.name)));
+    let config: StoredGroups = read_store(&dir.join("groups.json"));
+    for stored in &config.groups {
+        let meta = &stored.group;
+        let file = match &stored.file {
+            Some(file) if managed_file(file) => dir.join(file),
+            Some(_) => {
+                tracing::warn!("invalid rule-group storage filename; group not loaded");
+                continue;
+            }
+            None => dir.join(format!("{}.rules", safe_filename(&meta.name))),
+        };
         let text = fs::read_to_string(&file).unwrap_or_default();
         // The default group always exists by the time this runs — the manager is
         // built with one — so `add_group` refuses it and what the console saved
@@ -99,6 +122,13 @@ pub fn load_groups(dir: &Path, manager: &mut RuleManager) {
                 continue;
             }
             manager.set_text(&text);
+            if manager
+                .groups()
+                .iter()
+                .any(|g| g.name == "default" && g.enabled != meta.enabled)
+            {
+                manager.toggle_group("default");
+            }
             continue;
         }
         manager.add_group(&meta.name, &text, meta.enabled);
@@ -107,49 +137,97 @@ pub fn load_groups(dir: &Path, manager: &mut RuleManager) {
 
 /// Save all rule groups from `manager` to `dir`.
 pub fn save_groups(dir: &Path, manager: &RuleManager) {
-    // Owner-only: rules carry hostnames, credentials in proxy:// URLs, file
-    // paths. See `crate::private_fs`.
-    crate::private_fs::create_dir(dir).ok();
-    crate::private_fs::tighten(dir);
-
-    let config = GroupsConfig {
-        groups: manager
-            .groups()
-            .iter()
-            .map(|g| GroupMeta {
-                name: g.name.clone(),
-                enabled: g.enabled,
-            })
-            .collect(),
-    };
-
-    // Write groups.json.
-    if let Ok(json) = serde_json::to_string_pretty(&config) {
-        crate::private_fs::write(&dir.join("groups.json"), json.as_bytes()).ok();
-    }
-
-    // Write each group's text.
-    for g in manager.groups() {
-        let file = dir.join(format!("{}.rules", safe_filename(&g.name)));
-        crate::private_fs::write(&file, g.text.as_bytes()).ok();
+    if let Err(error) = try_save_groups(dir, manager.groups()) {
+        tracing::warn!("could not save rule groups: {error}");
     }
 }
 
-/// Save just the metadata (enabled states, order) without re-writing rule text.
-pub fn save_meta(dir: &Path, manager: &RuleManager) {
-    let config = GroupsConfig {
-        groups: manager
-            .groups()
+fn managed_file(file: &str) -> bool {
+    file.strip_prefix("rule-")
+        .and_then(|s| s.strip_suffix(".rules"))
+        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Content-addressed files avoid Unicode, punctuation and case-folding name
+/// collisions. Publish the manifest last: failed writes leave the old snapshot
+/// usable. Legacy files are read as before and never removed by this writer.
+pub(crate) fn try_save_groups(dir: &Path, groups: &[super::RuleGroup]) -> std::io::Result<()> {
+    crate::private_fs::create_dir(dir)?;
+    crate::private_fs::tighten(dir);
+    let previous = fs::read(dir.join("groups.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredGroups>(&bytes).ok());
+    let config = StoredGroups {
+        groups: groups
             .iter()
-            .map(|g| GroupMeta {
-                name: g.name.clone(),
-                enabled: g.enabled,
+            .map(|g| {
+                let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+                // Legacy APIs/stores may contain NULs: separators alone are ambiguous.
+                hash.update(&(g.name.len() as u64).to_be_bytes());
+                hash.update(g.name.as_bytes());
+                hash.update(g.text.as_bytes());
+                let digest: String = hash
+                    .finish()
+                    .as_ref()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                StoredGroup {
+                    group: GroupMeta {
+                        name: g.name.clone(),
+                        enabled: g.enabled,
+                    },
+                    file: Some(format!("rule-{digest}.rules")),
+                }
             })
             .collect(),
     };
-    if let Ok(json) = serde_json::to_string_pretty(&config) {
-        crate::private_fs::write(&dir.join("groups.json"), json.as_bytes()).ok();
+    let mut created = Vec::new();
+    let written: std::io::Result<()> = (|| {
+        for (group, meta) in groups.iter().zip(&config.groups) {
+            let file = dir.join(meta.file.as_ref().unwrap());
+            if fs::read(&file).is_ok_and(|bytes| bytes == group.text.as_bytes()) {
+                crate::private_fs::tighten(&file);
+                continue;
+            }
+            let existed = file.try_exists()?;
+            crate::private_fs::write(&file, group.text.as_bytes())?;
+            if !existed {
+                created.push(file);
+            }
+        }
+        crate::private_fs::write(
+            &dir.join("groups.json"),
+            &serde_json::to_vec_pretty(&config)?,
+        )
+    })();
+    if let Err(error) = written {
+        // Unpublished files from this attempt only; never an existing snapshot.
+        for file in created {
+            let _ = fs::remove_file(file);
+        }
+        return Err(error);
     }
+    if let Some(previous) = previous {
+        for file in previous.groups.iter().filter_map(|g| g.file.as_deref()) {
+            if managed_file(file)
+                && !config
+                    .groups
+                    .iter()
+                    .any(|g| g.file.as_deref() == Some(file))
+            {
+                // Only obsolete files named by the previous manifest, never a
+                // directory sweep or any legacy/user-authored rule file.
+                let _ = fs::remove_file(dir.join(file));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Metadata changes reuse unchanged text files, migrating legacy names if needed.
+pub fn save_meta(dir: &Path, manager: &RuleManager) {
+    save_groups(dir, manager);
 }
 
 /// Where the named-values store lives on disk.
@@ -172,10 +250,17 @@ pub fn save_values(dir: &Path, values: &std::collections::HashMap<String, String
     // `dir` is the storage root, which may be a directory the operator chose
     // and already had: created owner-only if new, otherwise left alone. The
     // file itself — values often hold tokens — is always owner-only.
-    crate::private_fs::create_dir(dir).ok();
-    if let Ok(json) = serde_json::to_string_pretty(values) {
-        crate::private_fs::write(&values_path(dir), json.as_bytes()).ok();
+    if let Err(error) = try_save_values(dir, values) {
+        tracing::warn!("could not save values: {error}");
     }
+}
+
+pub(crate) fn try_save_values(
+    dir: &Path,
+    values: &std::collections::HashMap<String, String>,
+) -> std::io::Result<()> {
+    crate::private_fs::create_dir(dir)?;
+    crate::private_fs::write(&values_path(dir), &serde_json::to_vec_pretty(values)?)
 }
 
 /// The console's switches that outlive a restart, in `switches.json`.
@@ -236,9 +321,36 @@ mod tests {
     }
 
     #[test]
-    fn safe_filename_sanitises() {
+    fn legacy_names_and_public_metadata_types_remain_compatible() {
         assert_eq!(safe_filename("my-group_1"), "my-group_1");
         assert_eq!(safe_filename("foo/bar..baz"), "foo_bar__baz");
+        let config = GroupsConfig {
+            groups: vec![GroupMeta {
+                name: "legacy".into(),
+                enabled: true,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(config).unwrap(),
+            serde_json::json!({"groups":[{"name":"legacy","enabled":true}]})
+        );
+    }
+
+    #[test]
+    fn storage_hash_encoding_is_unambiguous_even_for_legacy_control_characters() {
+        let dir = std::env::temp_dir().join(format!("whix-storage-hash-{}", std::process::id()));
+        let mut mgr = RuleManager::new();
+        mgr.add_group("a", "b\0c", false);
+        mgr.add_group("a\0b", "c", false);
+        try_save_groups(&dir, mgr.groups()).unwrap();
+        let config: StoredGroups =
+            serde_json::from_slice(&fs::read(dir.join("groups.json")).unwrap()).unwrap();
+        assert_ne!(config.groups[0].file, config.groups[1].file);
+        let mut restored = RuleManager::new();
+        load_groups(&dir, &mut restored);
+        assert_eq!(restored.groups()[0].text, "b\0c");
+        assert_eq!(restored.groups()[1].text, "c");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -261,6 +373,65 @@ mod tests {
         assert!(mgr2.groups()[1].text.contains("test.local"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_snapshots_preserve_legacy_files_and_remove_only_obsolete_managed_files() {
+        let dir = std::env::temp_dir().join(format!("whix-storage-managed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("groups.json"),
+            br#"{"groups":[{"name":"legacy","enabled":true}]}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("legacy.rules"), "# legacy content").unwrap();
+        let mut mgr = RuleManager::new();
+        load_groups(&dir, &mut mgr);
+        try_save_groups(&dir, mgr.groups()).unwrap();
+        let first: StoredGroups =
+            serde_json::from_slice(&fs::read(dir.join("groups.json")).unwrap()).unwrap();
+        let old_file = first.groups[0].file.as_ref().unwrap();
+        assert!(managed_file(old_file));
+        assert!(dir.join(old_file).exists());
+        let modified = fs::metadata(dir.join(old_file))
+            .unwrap()
+            .modified()
+            .unwrap();
+        save_meta(&dir, &mgr);
+        assert_eq!(
+            fs::metadata(dir.join(old_file))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+        mgr.update_group("legacy", "# new content");
+        try_save_groups(&dir, mgr.groups()).unwrap();
+        assert!(!dir.join(old_file).exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("legacy.rules")).unwrap(),
+            "# legacy content"
+        );
+        let mut restored = RuleManager::new();
+        load_groups(&dir, &mut restored);
+        assert_eq!(restored.groups()[0].text, "# new content");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_cannot_name_a_file_outside_the_rules_directory() {
+        let dir = std::env::temp_dir().join(format!("whix-storage-path-{}", std::process::id()));
+        fs::create_dir_all(dir.join("rules")).unwrap();
+        fs::write(dir.join("outside.rules"), "private.test host://127.0.0.1").unwrap();
+        fs::write(
+            dir.join("rules/groups.json"),
+            br#"{"groups":[{"name":"bad","enabled":true,"file":"../outside.rules"}]}"#,
+        )
+        .unwrap();
+        let mut mgr = RuleManager::new();
+        load_groups(&dir.join("rules"), &mut mgr);
+        assert!(mgr.groups().is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// A store that does not parse is kept, under another name, rather than

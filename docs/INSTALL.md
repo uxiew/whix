@@ -63,7 +63,7 @@ Windows 上把 `whix.exe` 放进一个目录（比如 `%LOCALAPPDATA%\Programs\w
 | --- | --- | --- |
 | `certs/root.crt` | 根证书，可以给客户端 | 第一次启动 |
 | `certs/root.key` | 根证书的私钥。拿到它的人可以对信任这个根证书的客户端冒充任何网站 | 第一次启动 |
-| `rules/groups.json`、`rules/<组名>.rules` | 规则组的顺序和开关、每组的文本 | 控制台保存规则时 |
+| `rules/groups.json`、`rules/rule-<哈希>.rules` | 组顺序、开关和文本文件指针；哈希覆盖组名与内容，避免中文／特殊字符／大小写名称碰撞。旧版 `<组名>.rules` 仍可读取 | 控制台保存规则时 |
 | `values.json` | Values | 控制台保存 Values 时 |
 | `sessions/sessions-YYYY-MM-DD.jsonl` | 历史会话，一行一条，按 UTC 日期分文件，默认留 7 天、最多 1 GiB（[OPERATIONS](OPERATIONS.md#采集与保留)） | 每条会话完成时；`--no-persist` 时不写 |
 | `lock`、`lock.owner` | 表示"这个目录有实例在用"，后者写着那个实例的 pid 和地址，见下文 | 每次启动 |
@@ -106,7 +106,9 @@ mv ~/.whistle-rs ~/.whix          # Windows：move %USERPROFILE%\.whistle-rs %US
 - 不改环境变量：控制台不要求登录。对外监听（`-H 0.0.0.0`）时，启动日志会有一条 `WARN listening on … with no console login`，局域网里谁都能打开控制台、改规则。
 - 自己写的插件里如果 `require` 了 `whistle-rs-plugin`，改成 `sdk/whix-plugin.js`；读 `WHISTLE_RS_PLUGIN_PORT` 的改成 `WHIX_PLUGIN_PORT`。
 
-**降级**（换回旧版本）不保证，但不会悄悄丢数据：
+**降级**（换回旧版本）不保证。升级前应在停机后备份整个数据目录：
+
+- 2026-10-19 起，规则元数据可通过 `file` 指向内容寻址的文本文件。新版能读旧格式，保存后保留旧文本文件，但它们不会继续更新。旧二进制不认识 `file`，直接读新版目录可能得到旧内容或空规则；回退必须恢复升级前的完整备份，不要让旧版直接写新版目录。迁移后的配置另用控制台「Backup all」保存，以便回到新版时恢复；
 
 - 旧版本不认识的字段直接跳过（有测试确认新增字段不会让读取失败）；
 - 整个 `groups.json`/`values.json` 都读不懂时，挪成 `*.unreadable-<毫秒>`，日志里 WARN 写明两个路径，再以空的开始。2026-09-29 之前构建的二进制没有这层保护，读不懂就当空的，下一次保存会覆盖掉；

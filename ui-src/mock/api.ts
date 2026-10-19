@@ -664,6 +664,27 @@ export function mockApi(): Plugin {
         g.text = text;
         return reply({ ok: true });
       }
+      case '/api/rule-group/rename': {
+        const { name, to } = JSON.parse((await readBody(req)) || '{}');
+        const group = groups.find((g) => g.name === name);
+        if (!group || typeof to !== 'string' || !to.trim() || to !== to.trim() || /[\x00-\x1f\x7f]/.test(to) || to === 'default' || (name !== to && groups.some((g) => g.name === to))) {
+          return reply({ ok: false, error: 'invalid or duplicate group name' });
+        }
+        group.name = to;
+        return reply({ ok: true });
+      }
+      case '/api/rule-groups/reorder': {
+        const { names } = JSON.parse((await readBody(req)) || '{}');
+        if (!Array.isArray(names) || names.length !== groups.length || new Set(names).size !== groups.length || !groups.every((g) => names.includes(g.name))) {
+          return reply({ ok: false, error: 'names must list every named group exactly once' });
+        }
+        groups.sort((a, b) => names.indexOf(a.name) - names.indexOf(b.name));
+        return reply({ ok: true });
+      }
+      case '/api/import/preview':
+      case '/api/import/apply':
+        // The merge contract lives in Rust, not a second mock implementation.
+        return reply({ ok: false, error: 'Import preview requires a real whix proxy; use the built console or npm run test:e2e:proxy.' });
       case '/api/rule-group/toggle': {
         const { name } = JSON.parse((await readBody(req)) || '{}');
         const g = groups.find((x) => x.name === name);

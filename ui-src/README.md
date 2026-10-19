@@ -40,9 +40,17 @@ npm run test:e2e
 PLAYWRIGHT_CHANNEL=chrome npm run test:e2e
 ```
 
-Playwright 自行启动并停止 `127.0.0.1:25199` 上的 Vite；端口被占用就失败，不接管已有服务。每条测试的 API 数据独立，不改真实代理规则，也不共用开发 mock 的写入状态。测试操作真实 Vue／CodeMirror，覆盖草稿切换、请求乱序、保存失败与重试、保存期间继续编辑、重复保存、重命名／删除和关闭提醒；这不是 Rust 后端端到端验收。失败截图和 trace 在 `test-results/`。CI 的 Node 24 控制台任务运行同一套 Chromium 测试并归档失败证据。
+`test:e2e` 自行启动并停止 `127.0.0.1:25199` 上的 Vite；端口被占用就失败，不接管已有服务。每条测试的 API 数据独立，不改真实代理规则，也不共用开发 mock 的写入状态。测试操作真实 Vue／CodeMirror，覆盖草稿切换、请求乱序、保存失败与重试、保存期间继续编辑、重复保存、重命名／删除和关闭提醒；这套不是 Rust 后端端到端验收。失败截图和 trace 在 `test-results/`。
+
+`npm run test:e2e:proxy` 则先构建前端和 Rust，再在 `127.0.0.1:25198` 启动真实 whix，使用它嵌入的生产控制台，验证配置预览／确认、覆盖、排序、草稿和真实代理响应。它只用自己新建的临时数据目录，不读取 `~/.whix`，结束后停止代理并清理该临时目录。已有 Chrome 时同样可加 `PLAYWRIGHT_CHANNEL=chrome`。CI 的 Node 24 控制台任务运行两套测试并归档失败证据。配置合并规则只在 Rust 实现，开发 mock 的新导入接口会明确报出需要真实代理，不另维护一份假合并算法。
 
 Rules 每个组、Values 每个名称及“All values”各有独立草稿，切组、切页和刷新接口不会覆盖未保存文本；保存确认的是点击保存时的快照，之后继续输入的内容仍显示 `Unsaved changes`。草稿只保存在当前页面内存，不写 `localStorage`；刷新／关闭时浏览器会提示，确认离开就会丢弃未保存内容。它不合并其他窗口的修改，“All values”保存仍是整份替换。
+
+### 从 Whistle 迁移
+
+先在 Values 页导入原版 Values 导出文件，再在 Rules 页导入规则导出文件；点击「Import…」只打开预览，核对覆盖项、前后顺序与开关后再点「Apply import」。预览中可下载当前配置备份。普通原版导出没有启用状态，新组默认关闭，需在预览勾选「Enable newly imported groups」或导入后逐组开启；精确边界、Default 特例和合并规则只在 [API 的规则与 Values](../docs/API.md#规则与-values) 说明。确认前配置若已变化，会拒绝应用，点「Refresh preview」重新核对。
+
+选中命名规则组后，用「Rename」「Move up」「Move down」改名或调整优先级；名称改变不丢草稿，移动不保存草稿。Default 不能改名或移动，始终最后匹配。同名项的导入会更新已保存内容，但不覆盖当前页面尚未保存的草稿。
 
 ## 目录结构
 

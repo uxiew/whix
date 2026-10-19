@@ -119,7 +119,7 @@ pub(super) fn rule_group_get(state: &Arc<AppState>, req: &Request<Incoming>) -> 
         .and_then(|q| {
             q.split('&')
                 .find_map(|p| p.strip_prefix("name="))
-                .map(|v| v.replace("%20", " ").replace("+", " "))
+                .map(percent_decode)
         })
         .unwrap_or_default();
     let mgr = state.rules.read().unwrap();
@@ -275,4 +275,69 @@ pub(super) async fn rule_group_delete(
     } else {
         json_error("group not found")
     }
+}
+
+pub(super) async fn rule_group_rename(
+    state: &Arc<AppState>,
+    req: Request<Incoming>,
+) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let (Some(name), Some(to)) = (payload["name"].as_str(), payload["to"].as_str()) else {
+        return json_error("name and to are required");
+    };
+    let mut mgr = state.rules.write().unwrap();
+    let before = mgr.groups().to_vec();
+    if !mgr.rename_group(name, to) {
+        return json_error(
+            "group not found, invalid name, or destination already exists; Default cannot be renamed",
+        );
+    }
+    if let Err(error) = persist_group_change(state, &mut mgr, before) {
+        return json_error(&error);
+    }
+    json_ok()
+}
+
+pub(super) async fn rule_groups_reorder(
+    state: &Arc<AppState>,
+    req: Request<Incoming>,
+) -> Response<DynBody> {
+    let payload = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Ok(names) = serde_json::from_value::<Vec<String>>(payload["names"].clone()) else {
+        return json_error("names must list every named group exactly once, without Default");
+    };
+    let mut mgr = state.rules.write().unwrap();
+    let before = mgr.groups().to_vec();
+    if !mgr.reorder_groups(&names) {
+        return json_error(
+            "names must list every named group exactly once, without Default; reload the group list",
+        );
+    }
+    if let Err(error) = persist_group_change(state, &mut mgr, before) {
+        return json_error(&error);
+    }
+    json_ok()
+}
+
+fn persist_group_change(
+    state: &Arc<AppState>,
+    mgr: &mut crate::rules::RuleManager,
+    before: Vec<crate::rules::RuleGroup>,
+) -> Result<(), String> {
+    if state.config.persist_edits
+        && let Err(error) = crate::rules::storage::try_save_groups(
+            &state.config.data_dir().join("rules"),
+            mgr.groups(),
+        )
+    {
+        mgr.replace_groups(before);
+        return Err(format!("could not save rule groups: {error}"));
+    }
+    Ok(())
 }

@@ -1927,14 +1927,57 @@ impl RuleManager {
 
     /// Rename a group. Returns false if old name not found or new name already exists.
     pub fn rename_group(&mut self, old_name: &str, new_name: &str) -> bool {
+        if old_name == "default"
+            || new_name == "default"
+            || new_name.trim().is_empty()
+            || new_name.trim() != new_name
+            || new_name.chars().any(char::is_control)
+        {
+            return false;
+        }
+        if old_name == new_name {
+            return self.groups.iter().any(|g| g.name == old_name);
+        }
         if self.groups.iter().any(|g| g.name == new_name) {
             return false;
         }
         if let Some(g) = self.groups.iter_mut().find(|g| g.name == old_name) {
             g.name = new_name.to_string();
+            // Parsed operators carry their source group's name too.
+            self.after_change(new_name);
             true
         } else {
             false
+        }
+    }
+
+    /// An exact permutation of the named groups; Default remains the fallback.
+    /// Refuse stale/partial lists rather than silently dropping a concurrent add.
+    pub fn reorder_groups(&mut self, names: &[String]) -> bool {
+        let named: Vec<_> = self.groups.iter().filter(|g| g.name != "default").collect();
+        let ranks: HashMap<&str, usize> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.as_str(), i + 1))
+            .collect();
+        if names.len() != named.len()
+            || ranks.len() != names.len()
+            || named.iter().any(|g| !ranks.contains_key(g.name.as_str()))
+        {
+            return false;
+        }
+        self.groups
+            .sort_by_key(|g| ranks.get(g.name.as_str()).copied().unwrap_or(0));
+        true
+    }
+
+    /// Commit a validated configuration while retaining this manager's modes
+    /// and include cache. Also used to roll back a failed persistence attempt.
+    pub(crate) fn replace_groups(&mut self, groups: Vec<RuleGroup>) {
+        self.groups = groups;
+        self.sync_includes();
+        for group in &mut self.groups {
+            group.reparse(&self.includes);
         }
     }
 }
@@ -3605,6 +3648,33 @@ mod group_tests {
         mgr.set_text("other.com host://2.2.2.2");
         assert_eq!(mgr.groups().len(), 1);
         assert!(mgr.resolve(&req("http://example.com/")).single.is_empty());
+    }
+
+    #[test]
+    fn rename_updates_source_labels_and_reorder_changes_only_named_precedence() {
+        let mut mgr = RuleManager::new();
+        mgr.set_text("example.com host://127.0.0.3");
+        mgr.add_group("A", "example.com host://127.0.0.1", true);
+        mgr.add_group("B", "example.com host://127.0.0.2", true);
+        assert!(mgr.rename_group("A", "Renamed"));
+        let resolved = mgr.resolve(&req("http://example.com/"));
+        assert_eq!(resolved.value("host"), Some("127.0.0.1"));
+        assert_eq!(resolved.single["host"].group.as_deref(), Some("Renamed"));
+        assert!(mgr.reorder_groups(&["B".into(), "Renamed".into()]));
+        assert_eq!(
+            mgr.resolve(&req("http://example.com/")).value("host"),
+            Some("127.0.0.2")
+        );
+        assert!(!mgr.reorder_groups(&["B".into(), "B".into()]));
+        assert!(!mgr.rename_group("default", "gone"));
+        assert!(!mgr.rename_group("B", "default"));
+        assert_eq!(
+            mgr.groups()
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "B", "Renamed"]
+        );
     }
 
     /// The **default group resolves last**, so a named group overrides it.

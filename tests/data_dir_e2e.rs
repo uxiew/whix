@@ -121,6 +121,21 @@ async fn an_embedded_console_leaves_the_kept_rules_and_values_alone() {
             br#"{"name":"beta","text":"b.test 6.6.6.6"}"#,
         ),
         ("POST", "/api/rule-group/toggle", br#"{"name":"beta"}"#),
+        (
+            "POST",
+            "/api/rule-group/rename",
+            br#"{"name":"beta","to":"renamed-beta"}"#,
+        ),
+        (
+            "POST",
+            "/api/rule-groups/reorder",
+            br#"{"names":["renamed-beta"]}"#,
+        ),
+        (
+            "POST",
+            "/api/rule-group/rename",
+            br#"{"name":"renamed-beta","to":"beta"}"#,
+        ),
         ("DELETE", "/api/rule-group", br#"{"name":"beta"}"#),
         ("POST", "/api/value", br#"{"name":"other","value":"b"}"#),
         (

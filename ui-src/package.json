@@ -12,6 +12,8 @@
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
     "test:e2e": "playwright test",
+    "pretest:e2e:proxy": "npm run build && cargo build --manifest-path ../Cargo.toml --locked",
+    "test:e2e:proxy": "playwright test --config playwright.migration.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {

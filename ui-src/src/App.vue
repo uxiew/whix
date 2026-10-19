@@ -4,6 +4,7 @@
 
 import { onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import AppToolbar from './components/AppToolbar.vue';
+import ImportDialog from './components/ImportDialog.vue';
 import { poll } from './poll';
 import ComposerHistory from './sidebar/ComposerHistory.vue';
 import PluginList from './sidebar/PluginList.vue';
@@ -22,6 +23,8 @@ import {
   actingOn,
   clearSelection,
   hasUnsavedEdits,
+  pendingImport,
+  finishImport,
   loadPageLogs,
   loadSessions,
   moveSelection,
@@ -111,6 +114,14 @@ onBeforeUnmount(() => {
 
 <template>
   <AppToolbar ref="toolbar" />
+  <ImportDialog
+    v-if="pendingImport"
+    :filename="pendingImport.filename"
+    :input="pendingImport.input"
+    :unsaved="hasUnsavedEdits"
+    @cancel="pendingImport = null"
+    @applied="finishImport"
+  />
 
   <div class="shell">
     <aside class="sidebar">

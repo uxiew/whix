@@ -34,6 +34,7 @@ mod composer;
 mod console_hosts;
 mod har;
 mod logs;
+mod migration;
 mod plugin_pages;
 mod rules;
 mod sessions;
@@ -106,10 +107,14 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("POST", "/api/explain") => explain_rules(state, req).await,
         ("GET", "/api/export") => bundle_export(state),
         ("POST", "/api/import") => bundle_import(state, req).await,
+        ("POST", "/api/import/preview") => migration::migration(state, req, false).await,
+        ("POST", "/api/import/apply") => migration::migration(state, req, true).await,
         ("GET", "/api/rule-groups") => rule_groups_get(state),
         ("POST", "/api/rule-groups") => rule_groups_add(state, req).await,
         ("POST", "/api/rule-group/toggle") => rule_group_toggle(state, req).await,
         ("POST", "/api/rule-group/update") => rule_group_update(state, req).await,
+        ("POST", "/api/rule-group/rename") => rule_group_rename(state, req).await,
+        ("POST", "/api/rule-groups/reorder") => rule_groups_reorder(state, req).await,
         ("GET", "/api/rule-group") => rule_group_get(state, &req),
         ("DELETE", "/api/rule-group") => rule_group_delete(state, req).await,
         ("GET", "/api/qr") => qr_svg(&req),

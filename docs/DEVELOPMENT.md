@@ -55,7 +55,7 @@ node tests/differential/run.js fast   # 需先在 tests/differential 里 npm ci
 git diff --check
 ```
 
-改动控制台编辑流程时还须运行 `npm run test:e2e --prefix ui-src`。浏览器安装、隔离方式与覆盖边界见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
+改动控制台编辑流程时还须运行 `npm run test:e2e --prefix ui-src`；配置迁移与规则组管理另跑 `npm run test:e2e:proxy --prefix ui-src`，后者会构建并使用真实 Rust 代理。浏览器安装、隔离方式与覆盖边界见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
 
 在 `rust-toolchain.toml` 钉住的工具链上，这些命令都应通过；任何一条失败都算门禁失败，不要用全局 `allow` 或降低 lint 级别绕过。最近一次实测的提交、环境和计数只记在 [STATUS](STATUS.md)，手册里不抄数字。普通测试不会执行 `#[ignore]` 基准；`--all-targets` 也不能替代单独的 doc tests。
 

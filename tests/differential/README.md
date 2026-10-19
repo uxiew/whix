@@ -12,6 +12,8 @@
 
 ## 怎么跑
 
+快速门禁还包含 `migration-export.js`：用所选版本的原始 Rules／Values 导出处理器验证 `tests/data/whistle/` 的迁移夹具，包括数字名称、空键顺序、文件夹标题和缺少 Default 内容的部分导出。它仅在 VM 中替换存储与响应对象，不加载会初始化用户数据目录和更新定时器的上游入口；同一份夹具由 `tests/config_migration_e2e.rs` 导入真实 whix，再验证响应优先级与重启结果。这不等于完整原版代理的迁移兼容认证。
+
 ```sh
 cargo build --locked            # 在仓库根目录跑；二进制比 src/ 旧，run.js 会拒绝
 cd tests/differential

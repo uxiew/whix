@@ -108,6 +108,7 @@ const FAST = [
   { name: 'oracle-docs', args: ['rules-oracle.js', '--values', '--quiet'], timeout: 5 * MINUTE },
   { name: 'oracle-cases', args: ['rules-oracle.js', '--from-cases', '--values', '--quiet'], ports: EXTRA, timeout: 5 * MINUTE },
   { name: 'qr', args: ['qr-bench.js'], timeout: 5 * MINUTE },
+  { name: 'migration-export', args: ['migration-export.js'], timeout: MINUTE },
 ];
 
 // `standard` is one pair shared by every corpus, the way they have always

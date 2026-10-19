@@ -192,6 +192,8 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `GET /api/rule-group?name=NAME` | 单组详情；名称需 URL 编码 |
 | `POST /api/rule-groups` | `{ "name": "dev", "text": "...", "enabled": true }` |
 | `POST /api/rule-group/update` | `{ "name": "dev", "text": "..." }` |
+| `POST /api/rule-group/rename` | `{ "name": "dev", "to": "new-name" }`；保持位置和开关，拒绝重名、控制字符和 Default；同名重命名为无操作 |
+| `POST /api/rule-groups/reorder` | `{ "names": ["first", "second"] }`；必须恰好列出全部命名组，不包含 `default`，重复、缺失或陌生名称均拒绝；相同顺序可重试 |
 | `POST /api/rule-group/toggle` | `{ "name": "dev" }`；切换而非显式设置，重试前注意当前状态 |
 | `DELETE /api/rule-group` | JSON `{ "name": "dev" }` |
 | `GET /api/values` | 字符串键值对象 |
@@ -201,8 +203,16 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `DELETE /api/value` | JSON `{ "name": "key" }` |
 | `GET /api/export` | 导出本项目格式的配置包，可能包含敏感 Values |
 | `POST /api/import` | 原样传入导出的配置包；带格式标记，不接受任意 JSON 冒充配置 |
+| `POST /api/import/preview` | `{ "format": "whistle-rules", "data": {...}, "enable_new": false }`；只读预览，返回 `token`、`groups`/`values` 的覆盖标记、完整 `before`/`after` 顺序和 `warnings` |
+| `POST /api/import/apply` | 原样提交预览输入并加上 `expected: token`；输入或当前配置变化就拒绝，必须重新预览 |
 
 调用方同时检查 HTTP 状态与响应 `ok/error`，不要因为成功解析出 JSON 就认为写入成功。导入、删除及覆盖规则前应保存自己的备份。
+
+预览接口支持 `whistle-rules`、`whistle-values`、`whix`、`rules-text`、`value-text`。前两种的 `data` 为原版导出的对象（空键数组或 `{list:[...]}` 是顺序元数据）；`whix` 的 `data` 为本项目配置包；两个纯文本格式的 `data` 为字符串，还须给 `name`。规则组名保持原样，原版的 `Default` 映射为本项目的 `default`；原版普通文件名 `default` 会冲突，须先改名，不能静默合并。`\r` 开头的文件夹标题忽略，其中文件的相对顺序保留。非法项目导致整个预览／导入失败，不作部分导入。
+
+合并时，导入的命名组按源顺序组成一个连续区块，放在被覆盖组的最早位置；没有同名组则追加。其余组保留内容、开关和相对顺序；Values 按名称合并。预览会展示因此产生的完整顺序变化。Default 无论显示位置都最后匹配。普通 Whistle 导出不含启停状态和运行模式：保留同名组开关，新组默认关闭，可用 `enable_new: true` 明确启用；不声称恢复 `backRulesFirst`、`multiEnv` 或全局开关。本项目配置包自带的 `enabled` 则按文件恢复。旧的 `/api/import` 仍保留原先的就地合并契约；控制台现在走预览／确认接口。
+
+新迁移接口写入失败不会提交新的运行时配置；规则文件先完整落盘，再替换其元数据，失败时旧规则快照仍可读。包含两类数据时先保存 Values，规则提交失败会尝试恢复旧 Values；若恢复也失败，接口明确报错，须从备份恢复。**这不是规则与 Values 两个存储之间的断电原子事务。**
 
 ## 开关：HTTPS、全部规则、插件
 

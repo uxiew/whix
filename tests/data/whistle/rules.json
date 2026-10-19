@@ -1,0 +1,7 @@
+{
+  "2": "rank.test statusCode://202 resBody://second",
+  "10": "rank.test statusCode://201 resBody://{reply}",
+  "Default": "rank.test statusCode://203 resBody://fallback",
+  "\rFolder": "",
+  "": ["Default", "10", "\rFolder", "2"]
+}
