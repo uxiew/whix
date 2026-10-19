@@ -501,8 +501,12 @@ export const api = {
   /** Test Rules: which operators a request *would* hit, without making one. */
   explain: (q: ExplainQuery) => postJson<Explanation>('/api/explain', q),
 
-  rules: async () => (await fetch('/api/rules')).text(),
-  saveRules: (text: string) => postText<{ ok: boolean; rules: number }>('/api/rules', text),
+  rules: async () => {
+    const res = await fetch('/api/rules');
+    if (!res.ok) throw new Error(`/api/rules: ${res.status}`);
+    return res.text();
+  },
+  saveRules: (text: string) => postText<OkResult & { rules?: number }>('/api/rules', text),
 
   ruleGroups: () => getJson<RuleGroup[]>('/api/rule-groups'),
   ruleGroup: (name: string) =>

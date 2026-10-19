@@ -21,6 +21,7 @@ import ValuesPane from './panes/ValuesPane.vue';
 import {
   actingOn,
   clearSelection,
+  hasUnsavedEdits,
   loadPageLogs,
   loadSessions,
   moveSelection,
@@ -81,7 +82,14 @@ function onKeydown(e: KeyboardEvent): void {
 
 let stopPolling: (() => void) | undefined;
 
+function beforeUnload(event: BeforeUnloadEvent): void {
+  if (!hasUnsavedEdits.value) return;
+  event.preventDefault();
+  event.returnValue = '';
+}
+
 onMounted(() => {
+  window.addEventListener('beforeunload', beforeUnload);
   document.addEventListener('keydown', onKeydown);
   void loadSessions();
   // Every two seconds while the proxy answers, less often while it does not,
@@ -95,6 +103,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeUnload);
   document.removeEventListener('keydown', onKeydown);
   stopPolling?.();
 });

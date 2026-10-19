@@ -19,6 +19,7 @@ const props = defineProps<{
   modelValue: string;
   language: 'whistle' | 'json';
   placeholder?: string;
+  readOnly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -39,6 +40,8 @@ function makeState(doc: string): EditorState {
     extensions: [
       lineNumbers(),
       history(),
+      EditorState.readOnly.of(!!props.readOnly),
+      EditorView.editable.of(!props.readOnly),
       drawSelection(),
       EditorView.lineWrapping,
       EditorState.tabSize.of(2),
@@ -69,10 +72,10 @@ onBeforeUnmount(() => view.value?.destroy());
 // A value that arrives from outside — a group loaded, a save round-tripped —
 // replaces the document *and* the history, the way opening a file should.
 watch(
-  () => props.modelValue,
-  (next) => {
+  () => [props.modelValue, props.readOnly] as const,
+  ([next, readOnly]) => {
     const v = view.value;
-    if (!v || next === v.state.doc.toString()) return;
+    if (!v || (next === v.state.doc.toString() && !!readOnly === v.state.readOnly)) return;
     v.setState(makeState(next));
   },
 );

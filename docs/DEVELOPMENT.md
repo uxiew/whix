@@ -55,6 +55,8 @@ node tests/differential/run.js fast   # 需先在 tests/differential 里 npm ci
 git diff --check
 ```
 
+改动控制台编辑流程时还须运行 `npm run test:e2e --prefix ui-src`。浏览器安装、隔离方式与覆盖边界见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
+
 在 `rust-toolchain.toml` 钉住的工具链上，这些命令都应通过；任何一条失败都算门禁失败，不要用全局 `allow` 或降低 lint 级别绕过。最近一次实测的提交、环境和计数只记在 [STATUS](STATUS.md)，手册里不抄数字。普通测试不会执行 `#[ignore]` 基准；`--all-targets` 也不能替代单独的 doc tests。
 
 格式化只用 rustfmt 默认配置（仓库里没有 `rustfmt.toml`）。整树重排这类纯格式提交要记进 `.git-blame-ignore-revs`，本地执行一次 `git config blame.ignoreRevsFile .git-blame-ignore-revs`，`git blame` 就会跳过它们。

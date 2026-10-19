@@ -5,7 +5,7 @@
 import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
 import SideTransfer from '../components/SideTransfer.vue';
-import { addGroup, exportGroup, selectGroup, setSwitches, state, toggleGroup } from '../store';
+import { addGroup, exportGroup, ruleDirty, selectGroup, setSwitches, state, toggleGroup } from '../store';
 
 const named = computed(() => state.groups.filter((g) => g.name !== 'default'));
 const sw = computed(() => state.switches);
@@ -33,6 +33,7 @@ const sw = computed(() => state.switches);
   </div>
   <SideItem
     label="Default"
+    :dirty="ruleDirty('default')"
     :selected="state.group === 'default'"
     @click="selectGroup('default')"
   />
@@ -42,6 +43,7 @@ const sw = computed(() => state.switches);
     :key="g.name"
     dot
     :label="g.name"
+    :dirty="ruleDirty(g.name)"
     :count="g.rules"
     :on="g.enabled"
     :off="!g.enabled"

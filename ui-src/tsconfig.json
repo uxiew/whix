@@ -20,5 +20,5 @@
     "types": ["vite/client", "node"],
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.vue", "mock/**/*.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.js", "src/**/*.vue", "mock/**/*.ts", "e2e/**/*.ts", "playwright.config.ts", "vite.config.ts"]
 }

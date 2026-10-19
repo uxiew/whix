@@ -5,3 +5,5 @@ node_modules
 # when it is there and writes a placeholder when it is not, so a checkout with
 # no Node still builds — see README.md.
 dist/
+test-results/
+playwright-report/

@@ -4,7 +4,7 @@
 
 import { onBeforeUnmount, onMounted } from 'vue';
 import CodeEditor from '../components/CodeEditor.vue';
-import { deleteGroup, saveRules, state } from '../store';
+import { deleteGroup, ruleDirty, rulesEditor, saveRules, state } from '../store';
 
 // Delete the selected group with the keyboard, since the source list has no
 // room for a per-row button without crowding the name.
@@ -26,7 +26,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown));
   <section class="pane">
     <div class="editor-wrap">
       <CodeEditor
-        v-model="state.rulesText"
+        :key="state.group"
+        v-model="rulesEditor.text"
+        :read-only="rulesEditor.saved === undefined"
         language="whistle"
         placeholder="pattern  operator1  operator2  …"
         @save="saveRules()"
@@ -37,9 +39,14 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown));
       </p>
     </div>
     <div class="actions">
-      <button class="btn primary" @click="saveRules()">Save</button>
+      <button
+        class="btn primary"
+        :disabled="rulesEditor.saved === undefined || rulesEditor.saving"
+        @click="saveRules()"
+      >Save</button>
+      <span v-if="ruleDirty(state.group)" class="status">Unsaved changes</span>
       <span class="spacer"></span>
-      <span class="status">{{ state.rulesStatus }}</span>
+      <span class="status">{{ rulesEditor.saving ? 'Saving…' : rulesEditor.loading ? 'Loading…' : rulesEditor.status }}</span>
     </div>
   </section>
 </template>

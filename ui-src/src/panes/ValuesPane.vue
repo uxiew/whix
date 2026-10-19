@@ -7,7 +7,7 @@
 // editor writes only the key it is showing.
 
 import CodeEditor from '../components/CodeEditor.vue';
-import { deleteValue, renameValue, saveValue, state } from '../store';
+import { deleteValue, renameValue, saveValue, state, valueDirty, valuesEditor, valuesSaving } from '../store';
 </script>
 
 <template>
@@ -17,18 +17,11 @@ import { deleteValue, renameValue, saveValue, state } from '../store';
            with it: stepping back through a *previous* value's edits into this
            one would write the wrong content under this name. -->
       <CodeEditor
-        v-if="state.valueKey !== null"
-        :key="state.valueKey"
-        v-model="state.valueText"
+        :key="JSON.stringify(state.valueKey)"
+        v-model="valuesEditor.text"
+        :read-only="valuesEditor.saved === undefined"
         language="json"
-        placeholder="the value, referenced as {name}"
-        @save="saveValue()"
-      />
-      <CodeEditor
-        v-else
-        v-model="state.valuesText"
-        language="json"
-        placeholder='{ "mock.json": "{\"ok\":true}" }'
+        :placeholder="state.valueKey === null ? 'A JSON object of named values' : 'the value, referenced as {name}'"
         @save="saveValue()"
       />
       <p v-if="state.valueKey !== null" class="hint">
@@ -42,13 +35,18 @@ import { deleteValue, renameValue, saveValue, state } from '../store';
       </p>
     </div>
     <div class="actions">
-      <button class="btn primary" @click="saveValue()">Save</button>
+      <button
+        class="btn primary"
+        :disabled="valuesEditor.saved === undefined || valuesSaving"
+        @click="saveValue()"
+      >Save</button>
+      <span v-if="valueDirty(state.valueKey)" class="status">Unsaved changes</span>
       <template v-if="state.valueKey !== null">
-        <button class="btn" @click="renameValue(state.valueKey)">Rename</button>
-        <button class="btn" @click="deleteValue(state.valueKey)">Delete</button>
+        <button class="btn" :disabled="valuesSaving" @click="renameValue(state.valueKey)">Rename</button>
+        <button class="btn" :disabled="valuesSaving" @click="deleteValue(state.valueKey)">Delete</button>
       </template>
       <span class="spacer"></span>
-      <span class="status">{{ state.valuesStatus }}</span>
+      <span class="status">{{ valuesEditor.saving ? 'Saving…' : valuesEditor.status }}</span>
     </div>
   </section>
 </template>

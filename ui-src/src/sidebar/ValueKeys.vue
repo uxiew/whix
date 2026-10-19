@@ -4,27 +4,26 @@
 // is to the group list: the whole store, edited as the one JSON object it is
 // stored as.
 
-import { computed } from 'vue';
 import SideItem from '../components/SideItem.vue';
 import SideTransfer from '../components/SideTransfer.vue';
-import { addValue, exportValues, selectValue, state } from '../store';
-
-const names = computed(() => Object.keys(state.values).sort());
+import { addValue, exportValues, selectValue, state, valueDirty, valueNames } from '../store';
 </script>
 
 <template>
   <div class="side-title">Values</div>
   <SideItem
     label="All values"
+    :dirty="valueDirty(null)"
     :selected="state.valueKey === null"
     @click="selectValue(null)"
   />
 
   <SideItem
-    v-for="name in names"
+    v-for="name in valueNames"
     :key="name"
     :label="name"
-    :count="String(state.values[name]).length"
+    :dirty="valueDirty(name)"
+    :count="String(state.values[name] ?? '').length"
     :selected="state.valueKey === name"
     @click="selectValue(name)"
   />

@@ -28,6 +28,22 @@ npm run typecheck # vue-tsc
 `mock/api.ts` 是一个 Vite 插件，`src/proxy/webui.rs` 能回答的每个路由它都回答，用的是一套专门挑来覆盖各种边角情况的测试数据（fixture）：一个失败的请求；一个超时、状态码为 0 的请求；一个带帧的 WebSocket（其中一帧被 `enable://ignoreSend` 丢掉，两帧被 `enable://pauseSend` 扣住，好让 Release 按钮有东西可放）；一个被截断的 body；一个不是 JSON 的 body；一张图片；一个既不是文本也不是图片、而且同样被截断的二进制 body；一个禁用的规则组；还有一个从没应答过的插件。它只在开发时用——`apply: 'serve'` 让它不进构建产物。它的状态跟着服务进程走：放行扣住的帧之后，想让它们回来，就重启 `npm run dev`。
 
 
+### 浏览器回归
+
+在 `ui-src` 目录运行：
+
+```sh
+npm ci
+npx --no-install playwright install chromium  # 首次安装测试用 Chromium
+npm run test:e2e
+# 本机已有 Chrome 时，也可不下载 Chromium；仍使用隔离的临时浏览器配置：
+PLAYWRIGHT_CHANNEL=chrome npm run test:e2e
+```
+
+Playwright 自行启动并停止 `127.0.0.1:25199` 上的 Vite；端口被占用就失败，不接管已有服务。每条测试的 API 数据独立，不改真实代理规则，也不共用开发 mock 的写入状态。测试操作真实 Vue／CodeMirror，覆盖草稿切换、请求乱序、保存失败与重试、保存期间继续编辑、重复保存、重命名／删除和关闭提醒；这不是 Rust 后端端到端验收。失败截图和 trace 在 `test-results/`。CI 的 Node 24 控制台任务运行同一套 Chromium 测试并归档失败证据。
+
+Rules 每个组、Values 每个名称及“All values”各有独立草稿，切组、切页和刷新接口不会覆盖未保存文本；保存确认的是点击保存时的快照，之后继续输入的内容仍显示 `Unsaved changes`。草稿只保存在当前页面内存，不写 `localStorage`；刷新／关闭时浏览器会提示，确认离开就会丢弃未保存内容。它不合并其他窗口的修改，“All values”保存仍是整份替换。
+
 ## 目录结构
 
 | 路径 | 是什么 |

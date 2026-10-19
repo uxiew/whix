@@ -104,6 +104,19 @@ jobs:
       - run: npm ci --prefix ui-src
       - run: npm run typecheck --prefix ui-src
       - run: npm run build --prefix ui-src
+      - name: Install the regression browser
+        if: matrix.node == '24'
+        working-directory: ui-src
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+      - name: Browser regressions — Rules and Values
+        if: matrix.node == '24'
+        run: npm run test:e2e --prefix ui-src
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure() && matrix.node == '24'
+        with:
+          name: console-browser-failures
+          path: ui-src/test-results/
+          retention-days: 14
 
   # D1: a release binary with the real console for each platform, used there
   # the way a person uses it (scripts/smoke.mjs: HTTP, intercepted HTTPS, WS,

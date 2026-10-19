@@ -11,6 +11,7 @@ defineProps<{
   off?: boolean;
   selected?: boolean;
   muted?: boolean;
+  dirty?: boolean;
 }>();
 </script>
 
@@ -22,6 +23,7 @@ defineProps<{
   >
     <span v-if="dot" class="dot" :class="{ on }"></span>
     <span class="side-name" :class="{ muted }">{{ label }}</span>
+    <span v-if="dirty" class="side-count" title="Unsaved changes">•</span>
     <span v-if="count !== undefined" class="side-count">{{ count }}</span>
   </div>
 </template>

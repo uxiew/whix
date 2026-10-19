@@ -31,6 +31,7 @@ import type {
 } from './api';
 import { COLUMNS } from './columns';
 import { clientOf, fmtBytes } from './format';
+import { createDrafts, isDirty, loadDraft, receiveDraft, saveDraft } from './editor/drafts';
 
 export type Pane = 'requests' | 'composer' | 'console' | 'rules' | 'values' | 'test' | 'status';
 export type DetailTab =
@@ -114,8 +115,6 @@ interface State {
   revealSeq: number;
   /** The value being edited, or `null` for the whole store as one JSON object. */
   valueKey: string | null;
-  /** The selected value's content, edited on its own. */
-  valueText: string;
   /** A transient message shown where the request count normally is. */
   note: string | null;
   /** True once a call to the proxy failed, until one succeeds. */
@@ -123,12 +122,8 @@ interface State {
 
   groups: RuleGroup[];
   group: string;
-  rulesText: string;
-  rulesStatus: string;
 
   values: Record<string, string>;
-  valuesText: string;
-  valuesStatus: string;
 
   /** The request being written in the Composer, and the ones already sent. */
   compose: Composition;
@@ -217,18 +212,13 @@ export const state = reactive<State>({
   prettyBody: true,
   revealSeq: 0,
   valueKey: null,
-  valueText: '',
   note: null,
   offline: false,
 
   groups: [],
   group: 'default',
-  rulesText: '',
-  rulesStatus: '',
 
   values: {},
-  valuesText: '',
-  valuesStatus: '',
 
   // A half-written request survives a reload. It has to: the console is served
   // by the proxy you are reconfiguring, so the page is reloaded far more often
@@ -1002,42 +992,60 @@ async function revealComposed(sent: Composition, url: string, after: number): Pr
 
 // ── rules ──────────────────────────────────────────────────────────────────
 
+const ruleDrafts = createDrafts<string>();
+const valueDrafts = createDrafts<string | null>();
+export const rulesEditor = computed(() => ruleDrafts.get(state.group));
+export const valuesEditor = computed(() => valueDrafts.get(state.valueKey));
+// Whole-store and per-key saves write the same Values store; do not race them.
+export const valuesSaving = computed(() => [...valueDrafts.entries.values()].some((d) => d.saving));
+export const ruleDirty = (name: string): boolean => isDirty(ruleDrafts.get(name));
+export const valueDirty = (name: string | null): boolean => isDirty(valueDrafts.get(name));
+export const hasUnsavedEdits = computed(() =>
+  [...ruleDrafts.entries.values(), ...valueDrafts.entries.values()].some((d) => isDirty(d) || d.saving),
+);
+let rulesLoadVersion = 0;
+let valuesLoadVersion = 0;
+
 export async function loadRules(): Promise<void> {
+  const version = ++rulesLoadVersion;
   void loadSwitches();
   const groups = await reach(api.ruleGroups);
+  if (version !== rulesLoadVersion) return;
   if (!groups) {
-    state.rulesStatus = 'Could not reach the proxy';
+    rulesEditor.value.status = 'Could not reach the proxy';
     return;
   }
   state.groups = groups;
-  await selectGroup(state.group, true);
+  await selectGroup(state.group);
 }
 
-export async function selectGroup(name: string, keepStatus = false): Promise<void> {
+export async function selectGroup(name: string): Promise<void> {
   state.group = name;
-  if (!keepStatus) state.rulesStatus = '';
-  const text = await reach(async () =>
-    name === 'default' ? await api.rules() : (await api.ruleGroup(name)).text || '',
-  );
-  if (text === undefined) {
-    state.rulesStatus = 'Could not reach the proxy';
-    return;
-  }
-  state.rulesText = text;
+  await loadDraft(ruleDrafts.get(name), async () => {
+    const text = await reach(async () =>
+      name === 'default' ? await api.rules() : (await api.ruleGroup(name)).text || '',
+    );
+    if (text === undefined) throw new Error('Could not reach the proxy');
+    return text;
+  });
 }
 
 export async function saveRules(): Promise<void> {
-  try {
-    if (state.group === 'default') {
-      const res = await api.saveRules(state.rulesText);
-      state.rulesStatus = `Saved · ${res.rules} rules active`;
-      return;
+  const name = state.group;
+  const saved = await saveDraft(ruleDrafts.get(name), async (text) => {
+    if (name === 'default') {
+      const res = await api.saveRules(text);
+      if (!res.ok) throw new Error(res.error || 'Save failed');
+      return res.rules === undefined ? 'Saved' : `Saved · ${res.rules} rules active`;
     }
-    const res = await api.updateRuleGroup(state.group, state.rulesText);
-    state.rulesStatus = res.ok ? 'Saved' : res.error || 'Save failed';
-    await loadRules();
-  } catch {
-    state.rulesStatus = 'Save failed';
+    const res = await api.updateRuleGroup(name, text);
+    if (!res.ok) throw new Error(res.error || 'Save failed');
+    return 'Saved';
+  });
+  if (saved) {
+    const version = ++rulesLoadVersion;
+    const groups = await reach(api.ruleGroups);
+    if (groups && version === rulesLoadVersion) state.groups = groups;
   }
 }
 
@@ -1059,6 +1067,7 @@ export async function toggleGroup(name: string): Promise<void> {
 }
 
 export async function deleteGroup(name: string): Promise<void> {
+  if (ruleDrafts.get(name).saving) return;
   if (!confirm(`Delete group "${name}"?`)) return;
   const res = await api.deleteRuleGroup(name);
   if (!res.ok) {
@@ -1066,59 +1075,71 @@ export async function deleteGroup(name: string): Promise<void> {
     return;
   }
   if (state.group === name) state.group = 'default';
+  ruleDrafts.remove(name);
   await loadRules();
 }
 
 // ── values ─────────────────────────────────────────────────────────────────
 
 export async function loadValues(): Promise<void> {
+  if (valuesSaving.value) return;
+  const version = ++valuesLoadVersion;
   const values = await reach(api.values);
+  if (version !== valuesLoadVersion) return;
   if (!values) {
-    state.valuesStatus = 'Could not reach the proxy';
+    valuesEditor.value.status = 'Could not reach the proxy';
     return;
   }
   state.values = values;
-  state.valuesText = JSON.stringify(values, null, 2);
-  // A key that is no longer there — deleted, or renamed from another window —
-  // falls back to the whole store rather than editing something that is gone.
-  if (state.valueKey !== null && !(state.valueKey in values)) state.valueKey = null;
-  if (state.valueKey !== null) state.valueText = values[state.valueKey];
+  receiveDraft(valueDrafts.get(null), JSON.stringify(values, null, 2));
+  for (const [name, text] of Object.entries(values)) receiveDraft(valueDrafts.get(name), text);
+  // A remote deletion must not hide a local unsaved draft.
+  for (const [name, draft] of valueDrafts.entries) {
+    if (name !== null && !(name in values) && !isDirty(draft)) valueDrafts.remove(name);
+  }
+  if (state.valueKey !== null && !(state.valueKey in values) && !valueDirty(state.valueKey)) {
+    state.valueKey = null;
+  }
 }
+
+export const valueNames = computed(() => {
+  const names = new Set(Object.keys(state.values));
+  for (const [name, draft] of valueDrafts.entries) {
+    if (name !== null && isDirty(draft)) names.add(name);
+  }
+  return [...names].sort();
+});
 
 /** Edit one value, or `null` for the whole store as one JSON object. */
 export function selectValue(name: string | null): void {
   state.valueKey = name;
-  state.valuesStatus = '';
-  state.valueText = name === null ? '' : (state.values[name] ?? '');
 }
 
 /** Save whichever of the two the Values pane is showing. */
 export async function saveValue(): Promise<void> {
-  if (state.valueKey === null) return saveValues();
-  const name = state.valueKey;
-  const res = await reach(() => api.setValue(name, state.valueText));
-  if (!res) {
-    state.valuesStatus = 'Save failed';
-    return;
-  }
-  state.valuesStatus = res.ok ? 'Saved' : res.error || 'Save failed';
-  await loadValues();
+  await persistValue(state.valueKey);
 }
 
 export async function saveValues(): Promise<void> {
-  try {
-    JSON.parse(state.valuesText);
-  } catch (e) {
-    state.valuesStatus = 'Invalid JSON: ' + (e as Error).message;
-    return;
-  }
-  try {
-    await api.saveValues(state.valuesText);
-    state.valuesStatus = 'Saved';
-    await loadValues();
-  } catch {
-    state.valuesStatus = 'Save failed';
-  }
+  await persistValue(null);
+}
+
+async function persistValue(name: string | null): Promise<void> {
+  if (valuesSaving.value) return;
+  valuesLoadVersion++;
+  const saved = await saveDraft(valueDrafts.get(name), async (text) => {
+    if (name === null) {
+      try {
+        JSON.parse(text);
+      } catch (e) {
+        throw new Error('Invalid JSON: ' + (e as Error).message);
+      }
+    }
+    const res = await reach(() => name === null ? api.saveValues(text) : api.setValue(name, text));
+    if (!res?.ok) throw new Error(res?.error || 'Save failed');
+    return 'Saved';
+  });
+  if (saved) await loadValues();
 }
 
 export async function addValue(): Promise<void> {
@@ -1134,6 +1155,7 @@ export async function addValue(): Promise<void> {
 }
 
 export async function renameValue(name: string): Promise<void> {
+  if (valuesSaving.value) return;
   const to = prompt('Rename value to:', name);
   if (!to || !to.trim() || to.trim() === name) return;
   const res = await api.renameValue(name, to.trim());
@@ -1141,18 +1163,21 @@ export async function renameValue(name: string): Promise<void> {
     alert(res.error || 'Failed');
     return;
   }
-  state.valueKey = to.trim();
+  valueDrafts.rename(name, to.trim());
+  if (state.valueKey === name) state.valueKey = to.trim();
   await loadValues();
 }
 
 export async function deleteValue(name: string): Promise<void> {
+  if (valuesSaving.value) return;
   if (!confirm(`Delete value "${name}"?`)) return;
   const res = await api.deleteValue(name);
   if (!res.ok) {
     alert(res.error || 'Failed');
     return;
   }
-  selectValue(null);
+  valueDrafts.remove(name);
+  if (state.valueKey === name) selectValue(null);
   await loadValues();
 }
 
@@ -1173,13 +1198,13 @@ export function downloadText(name: string, text: string, type = 'text/plain'): v
 
 /** The selected group, as the rules file it is — the editor's text, as shown. */
 export function exportGroup(): void {
-  downloadText(`${state.group}.rules`, state.rulesText);
+  downloadText(`${state.group}.rules`, rulesEditor.value.text);
 }
 
 /** The selected value, or the whole store as the JSON object it is kept as. */
 export function exportValues(): void {
-  if (state.valueKey === null) downloadText('values.json', state.valuesText, 'application/json');
-  else downloadText(state.valueKey, state.valueText);
+  if (state.valueKey === null) downloadText('values.json', valuesEditor.value.text, 'application/json');
+  else downloadText(state.valueKey, valuesEditor.value.text);
 }
 
 /** The parsed object if `text` is an exported bundle, and `null` otherwise. */
@@ -1232,8 +1257,8 @@ export async function importFile(file: File): Promise<void> {
     const note = `Imported ${res.groups ?? 0} groups and ${res.values ?? 0} values`;
     await loadRules();
     await loadValues();
-    state.rulesStatus = note;
-    state.valuesStatus = note;
+    rulesEditor.value.status = note;
+    valuesEditor.value.status = note;
     return;
   }
 
@@ -1250,7 +1275,7 @@ export async function importFile(file: File): Promise<void> {
     }
     state.group = name;
     await loadRules();
-    state.rulesStatus = `Imported ${file.name}`;
+    rulesEditor.value.status = `Imported ${file.name}`;
     return;
   }
 
@@ -1259,7 +1284,7 @@ export async function importFile(file: File): Promise<void> {
     await api.setValue(key, value);
   }
   await loadValues();
-  state.valuesStatus = `Imported ${file.name}`;
+  valuesEditor.value.status = `Imported ${file.name}`;
 }
 
 // ── status ─────────────────────────────────────────────────────────────────

@@ -1117,3 +1117,20 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 ## 不应混入必做清单的事情
 
 直接兼容 npm 插件、逐像素复刻官方 React UI、复刻 `/cgi-bin/*` 数据模型、强制随代理捆绑 Node，都不是本项目当前交付目标。没有新的产品决策，不应把它们作为“全面对齐”的隐含承诺。确有迁移客户时，单独设计薄适配层与契约测试，不污染核心协议。
+
+## 2026-10-19 Rules／Values 编辑可靠性
+
+基线 `ea051b2`。修复前先运行 4 条浏览器回归，全部按预期失败：切规则组丢草稿、较晚返回的组 A 覆盖已选中的组 B、切 Value 丢草稿、接口刷新覆盖新编辑。修复把文本及保存状态归属到各自的编辑对象，并拒绝过期读取。使用方式、草稿的内存边界与测试入口统一见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
+
+本机环境：macOS arm64、Node 24.9.0、Chrome 154.0.8037.98、Playwright 1.64.1。新增的只是 3 个锁定的测试包，锁文件中原有依赖条目未变。
+
+| 检查 | 结果 |
+| --- | --- |
+| `PLAYWRIGHT_CHANNEL=chrome npm run test:e2e --prefix ui-src -- --repeat-each=3` | 21 个用例，连续 3 轮，63/63 通过；包括保存拒绝／网络失败、保存期间继续编辑、重复保存、初始加载失败、同组请求乱序、空草稿、Value 重命名／删除与关闭提醒 |
+| `npm run typecheck --prefix ui-src` | 通过，包含测试代码与 Playwright 配置 |
+| `npm run build --prefix ui-src` | 通过，仍只生成一个自包含 HTML |
+| `node scripts/check-links.mjs` | 21 份 Markdown，没有失效的相对链接或锚点 |
+| `cargo fmt --all -- --check`、`git diff --check` | 通过 |
+| CI workflow YAML | 解析通过；Node 24 控制台任务已加入 Chromium 回归和失败截图／trace 归档 |
+
+**验证边界：** 浏览器运行真实前端，但编辑 API 是每条用例独立的夹具，不修改真实规则。未运行 Rust 全量测试、真代理网络差分或远端 CI；本轮没有 Rust 代码改动，也未重建嵌入控制台的 Rust 二进制。未改变“All values”整份保存语义，不合并其他窗口的编辑；用户确认离开页面后，未保存草稿不会恢复。
