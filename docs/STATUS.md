@@ -1278,3 +1278,32 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 证据（均为未入库的本地测试产物）：`target/differential/frame-startup-investigation/` 下的 `concurrent-128/` 与 `concurrent-128-prepared/` 是单变量诊断对照，`permanent-old/` 与 `permanent-final/` 是移除临时补丁后的复验；`prototype-red/` 保存旧实现首次读取原型为 `undefined`、Whistle 为 `function` 的确定性红灯。完整网络分别归档在 `target/differential/network-frame-startup-fixed-20261021-2.10.8/`、`network-frame-startup-fixed-20261021-2.10.10/`，矩阵为同目录的 `network-frame-startup-fixed-20261021-matrix.json`。
 
 **证据边界：** 历史单次失败当时没有代理诊断，不能倒推它的唯一原因；本轮确认的是可重复产生相同输入／缺帧症状的启动预算问题。修复只影响 WebSocket 和 inspect TCP 的 `frameScript`，其他脚本未改；启动成本与计时边界见 [规则说明](RULES.md#脚本)。128 并发不是所有机器的容量承诺。没有运行跨平台或远端 CI，也没有改用户真实代理数据、系统代理、证书信任库或依赖锁文件；只本地提交，不推送。
+
+## 2026-10-21 reqScript／resScript 初始化与 PAC 核查
+
+**结论：** reqScript、resScript 的规则模式与正文钩子都有相同的预算混用问题；PAC 没有走这个懒加载入口。原实现每类以 128 线程同步起跑、执行 5 轮，直接调用真实执行入口并核对返回的规则／状态／正文／代理字符串：
+
+| 路径 | 修复前，640 次执行 | 修复后，640 次执行 |
+| --- | --- | --- |
+| reqScript | 2 次 `OutOfTime` | 全部通过 |
+| resScript 生成规则 | 101 次 `OutOfTime` | 全部通过 |
+| resScript 正文钩子 | 2 次 `OutOfTime` | 全部通过 |
+| PAC | 全部通过 | 全部通过，生产路径未改 |
+
+前三条路径首次调用 Buffer 时，在用户的 1 秒墙钟预算内编译并执行内置 Node 兼容代码。现在统一在 `script_engine()` 返回前完成可信初始化，并删除 frameScript 的重复准备；计时、循环上限和失败时丢弃结果的规则不变。PAC 原本就先注册原生函数、执行 `PAC_HELPERS`，再分别给文件和 `FindProxyForURL` 创建执行预算；不向它加入 Node 环境，也没有改变其错误处理。
+
+**性能代价明确存在：** 同机 debug 构建、每项 200 次的平均引擎准备时间，从约 **6.01 ms 增至 44.34 ms**；包含一次 Buffer 调用的总准备时间约 **45.05 → 45.27 ms**。因此不用辅助函数的简单脚本也会付出准备成本，不再保留懒加载快路径。这不是 release 吞吐量测试，也不承诺任何机器的启动延迟；不能把正确性修复说成没有性能代价。
+
+**回归与验证：**
+
+- 新增 7 条普通检查：三个 Node 脚本入口的准备顺序、PAC 独立环境、PAC 文件／函数超时不返回 DIRECT、用户脚本超时不返回部分修改，以及正文钩子的真实 loopback 代理响应。超时负例另有 4 秒测试 watchdog，避免限时回归把测试自身挂住。旧实现的三条准备顺序检查确定性失败，修复后通过。
+- 新增独立的、有参数上限的并发检查，默认在普通测试中忽略以免互相争抢 CPU；本轮已单独运行并通过，四类各 640 次，不是 HTTP 并发吞吐量测试。参数非法值和最小值也已验证，命令见 [差分说明](../tests/differential/README.md#脚本初始化与执行预算)。
+- `cases-compose` 新增两个真实 Whistle 对照：首次读取 Buffer 原型时，请求／响应头应为 `function`。旧二进制产生 `undefined`，两项明确失败；最终在两版上均通过。
+- Rust 全部目标 **1250 通过、12 个忽略项**（其中新压力检查另跑通过）；文档测试 **2 通过**；fmt、Clippy `-D warnings`、JS 语法、文档链接与 diff 检查通过。
+- Whistle **2.10.8／2.10.10 各 6/6 个相关网络阶段通过**：`cases-bodies, cases-compose, cases-proxy, frames, ws, core`；core 各 118 条，未声明差异为 0。两版快速差分各 **4/4 通过**，版本矩阵退出码 0，没有新增豁免。
+
+附带记录：2.10.10 首轮 `cases-bodies` 有一项 `resAppend just over the rewrite ceiling` 的 `Expires` 相差 2 秒，超过夹具原有的 1 秒容差；该轮保留为失败，不能计作通过。诊断中仅将两个代理请求间隔设为 2300 ms，并采集实际响应头时间，复现了绝对日期差异；两端过期时间相对收头时刻分别为 -60000669／-60000080 ms，均符合固定减 60000000 ms 与 HTTP 日期的秒级舍入。这个用例不执行脚本，本轮没有改其产品逻辑、夹具时钟容差或豁免。原样重跑 2.10.10 的 6 阶段通过；夹具在串行慢请求下仍可能出现此类误报。
+
+证据（本地未入库）：`target/differential/script-budget-investigation/` 保存旧／新执行测试二进制与日期诊断采样；`script-budget-red-20261021-2.10.8/` 保存请求／响应头的红灯；最终网络为 `script-budget-fixed-20261021-2.10.8/`、`script-budget-verified-20261021-2.10.10/`，首次含时钟差异的失败为 `script-budget-fixed-20261021-2.10.10/`；快速套件为 `script-budget-fast-20261021-2.10.8/`、`script-budget-fast-20261021-2.10.10/`，日期诊断为 `script-budget-clock-observed-20261021/`，均在 `target/differential/` 下。最终差分固定二进制 SHA-256：`9c4138fc468f24f0a1f6608813fc586a2fa8e43884a7f395d01dfbd179d6023d`。
+
+**边界：** 本轮是 macOS arm64 的合成验证，Rust 1.98.1，差分 Node 26.5.0；没有重跑完整 29 阶段、浏览器、跨平台或远端 CI，也没有进行 release 性能或慢 DNS 压测。PAC 的执行期 DNS 等工作不在本次初始化修复范围内。未改真实代理数据、系统代理、证书信任库或依赖锁文件；只本地提交，不推送。

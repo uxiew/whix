@@ -507,3 +507,19 @@ node tests/differential/traffic-stress.js --seconds 300 --connections 32 --frame
 代理与源站只监听回环地址，代理用独立临时目录和 `--no-persist`，退出时清理自己启动的连接和进程。JSON 结果默认保存在 `target/traffic-stress/`，记录二进制／脚本 SHA-256、参数、收帧校验数与错误。macOS／Linux 每 5 秒采样一次代理 RSS（常驻内存），超过 512 MiB 安全阈值就停止；Windows 不采集此指标。采样最大值不代表瞬时真实峰值。
 
 CI 只接入第一条短跑命令，失败结果随差分附件上传。长跑用于手工复验，不是吞吐量、容量或无限期无泄漏的承诺，也不是与 Whistle 的性能对照；本工具只覆盖无压缩的明文 WebSocket，TLS、压缩、分片与恶劣网络条件仍需独立验证。
+
+## 脚本初始化与执行预算
+
+在仓库根目录运行普通回归；压力检查必须单独执行，不要与编译或其他测试并行：
+
+```sh
+cargo test --locked --test script_startup
+cargo test --locked --test script_startup concurrent_script_startup_keeps_results -- --ignored --nocapture
+```
+
+普通回归检查 reqScript、resScript 两种模式的初始化顺序、正文钩子的真实代理响应、用户
+限时仍生效，以及 PAC 的独立环境和失败不会变成 DIRECT。并发检查默认每类 128 线程、
+5 轮；可用 `SCRIPT_STARTUP_THREADS=1..128`、`SCRIPT_STARTUP_ROUNDS=1..10` 调整。
+它直接调用真实执行入口、分别断言规则／状态／正文／PAC 结果，不代表 HTTP 吞吐量或所有
+机器的并发容量；默认忽略是为了不把 CPU 争抢带进普通测试，手工运行的退出码仍须为 0。
+`cases-compose` 另含两条真实 Whistle 对照，检查首次访问 Buffer 原型时请求／响应头的值。

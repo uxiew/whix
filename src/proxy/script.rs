@@ -159,16 +159,10 @@ pub(crate) fn off_the_runtime<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// What every engine gets before anything else runs: the `RegExp` statics,
-/// and the Node parts as **stubs that load on first use**.
-///
-/// Evaluating [`NODE_PRELUDE`] takes about 3 ms in a release build — it is
-/// twelve hundred lines, and this engine compiles them every time, because a
-/// compiled script cannot leave the thread it was compiled on. Most scripts
-/// push a rule and never name `Buffer`; charging each of them that is how a
-/// `reqScript` would come to cost more than the request it decorates. So each
-/// name starts as a small function that, the first time it is called, compiles
-/// the real thing and hands over to it.
+/// The `RegExp` statics and the Node helper installer. The constructor forces
+/// the installer before returning, so trusted preparation cannot consume a
+/// user's execution budget. Loading through JavaScript also avoids re-entering
+/// the engine from a native function while it is already evaluating code.
 const BOOTSTRAP: &str = r#"
 (function (global) {
   'use strict';
@@ -313,6 +307,10 @@ pub(crate) fn script_engine() -> Option<Context> {
         .ok()?;
     if let Err(err) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
         tracing::error!("the script bootstrap does not evaluate: {err}");
+        return None;
+    }
+    if let Err(err) = ctx.eval(Source::from_bytes(b"Buffer.alloc(0)")) {
+        tracing::error!("the script helpers do not initialize: {err}");
         return None;
     }
     Some(ctx)
@@ -1405,12 +1403,6 @@ fn start_frame_script(
     ctx.eval(Source::from_bytes(FRAME_GLUE.as_bytes()))
         .inspect_err(|err| tracing::error!("the frame-script glue does not evaluate: {err}"))
         .ok()?;
-    // Frame dispatch always needs Buffer. Compile the trusted Node helpers
-    // before starting the user's clock: lazy loading under contention can
-    // otherwise spend that budget before even a greeting has been queued.
-    ctx.eval(Source::from_bytes(b"Buffer.alloc(0)"))
-        .inspect_err(|err| tracing::error!("the frame-script helpers do not initialize: {err}"))
-        .ok()?;
     if let Err(why) = eval_bounded(&mut ctx, &spec.src, Instant::now() + TIME_LIMIT) {
         tracing::debug!("frameScript {why}");
         return None;
@@ -2483,12 +2475,12 @@ mod tests {
         );
     }
 
-    /// The Node parts load the first time one is used, and nothing a script
-    /// can do around that moment shows. The first case is the one that broke
-    /// an earlier design: the *second* call from one call site.
+    /// Installed helpers keep their identity, repeated calls work, and user
+    /// overrides survive. The second call from one call site once broke the
+    /// installer's inline caches; retain that regression after eager loading.
     #[test]
-    fn the_node_parts_load_on_first_use_without_showing() {
-        // Called twice from one call site, the first of which triggers the load.
+    fn the_node_parts_keep_aliases_and_user_overrides() {
+        // Multiple calls from one call site use the same installed helper.
         assert_eq!(
             node("['a=1', 'b=2'].map(function (q) { return parseQuery(q); })"),
             json!([{"a": "1"}, {"b": "2"}])
@@ -2497,8 +2489,7 @@ mod tests {
             node("['gbk', 'nope', 'big5'].map(function (e) { return encodingExists(e); })"),
             json!([true, false, true])
         );
-        // A reference taken before the load still works after it, and is the
-        // same `Buffer` as the one instances are made by.
+        // Aliases and instances agree on the same Buffer constructor.
         assert_eq!(
             node(
                 "(function () { var B = Buffer, pq = parseQuery; var b = B.from('ab'); return [b instanceof B, b instanceof Buffer, B === Buffer, Buffer.isBuffer(b), pq('x=1').x, typeof B.from]; })()"
@@ -2513,8 +2504,7 @@ mod tests {
             ),
             json!([2, "6869", "bcd"])
         );
-        // A script's own function by one of these names stays the script's,
-        // whether it was there before the load or not.
+        // A script can still replace a helper with its own function.
         let mut ctx = script_engine().expect("engine");
         let out = ctx
             .eval(Source::from_bytes(
@@ -2556,7 +2546,7 @@ mod tests {
                 .expect("loads");
         }
         println!(
-            "script_engine() and the Node parts: {:?} each",
+            "script_engine() and a Buffer call: {:?} each",
             started.elapsed() / n
         );
         let mut ctx = script_engine().expect("engine");

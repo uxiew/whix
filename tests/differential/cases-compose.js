@@ -125,6 +125,8 @@ module.exports = [
   // executed, and the array it pushes becomes the rules. This port used to run
   // none of them.
   { name: 'a reqScript pushes a rule', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-s=1')`) },
+  { name: 'reqScript helpers are ready before user code', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-helper=' + typeof Buffer.prototype.writeUInt32LE)`) },
+  { name: 'resScript helpers are ready before user code', rules: `${P} resScript://{s}` + V('s', `rules.push('${P} resHeaders://x-helper=' + typeof Buffer.prototype.writeUInt32LE)`) },
   { name: 'a resScript reads the status', rules: `${P} resScript://{s}` + V('s', `if (statusCode == 200) rules.push('${P} resHeaders://x-rs=ok')`) },
   { name: 'a script that throws contributes nothing', rules: `${P} reqScript://{s}` + V('s', `rules.push('${P} reqHeaders://x-t=1'); throw new Error('x')`) },
   { name: 'a script reading the request url', rules: `${P} reqScript://{s}` + V('s', `if (url.indexOf('q=1') !== -1) rules.push('${P} reqHeaders://x-u=1')`), request: { path: '/echo?q=1' } },
