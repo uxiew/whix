@@ -94,6 +94,15 @@ pub struct Session {
     pub unapplied: Vec<unapplied::Unapplied>,
 }
 
+impl Session {
+    /// Imported records have no live destination. Using the existing target
+    /// discriminator also preserves provenance in old history formats without
+    /// changing the public Session struct's fields.
+    pub fn is_imported_har(&self) -> bool {
+        self.target == "imported HAR"
+    }
+}
+
 /// Read a single header as an owned string, if present and valid UTF-8.
 pub(super) fn header_str(
     headers: &hyper::HeaderMap,

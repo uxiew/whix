@@ -94,6 +94,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 # returns `{"a":1,"keep":"yes","extra":1}`. The bytes a client receives are not
 # the place to reorder anything.
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
+# Already locked through rcgen; use its RFC3339 parser rather than inventing
+# timezone/date handling for imported HAR timestamps.
+time = { version = "=0.3.53", features = ["parsing"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1.44"

@@ -11,6 +11,7 @@ import { computed, reactive, ref, shallowRef, watch } from 'vue';
 import { api } from './api';
 import type { ImportInput } from './api';
 import { classifyImport } from './import-file';
+import { base64Of, bytesOf, bodyFile } from './bytes';
 // The filter grammar, imported for its side effect: the module is plain
 // script-shaped JavaScript with no exports, because the same file is evaluated
 // by a Rust test in the engine the proxy already carries. One copy, so the
@@ -163,7 +164,7 @@ function blankTest(): TestQuery {
 
 /** What the Composer opens on, and what "New request" goes back to. */
 function blankComposition(): Composition {
-  return { method: 'GET', url: '', headers: '', body: '' };
+  return { method: 'GET', url: '', headers: '', body: '', body_encoding: 'utf8' };
 }
 
 /** The method as it will be *sent*: trimmed, uppercased, empty meaning GET. */
@@ -241,7 +242,11 @@ watch(
   () => [state.captureInclude, state.captureExclude],
   ([inc, exc]) => writeStored(CAPTURE_KEY, { inc, exc }),
 );
-watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, c), { deep: true });
+function storedComposition(c: Composition): Composition {
+  return c.body_encoding === 'base64' && c.body
+    ? { ...c, body: '', body_incomplete: true, allow_partial: false } : c;
+}
+watch(() => state.compose, (c) => writeStored(COMPOSE_KEY, storedComposition(c)), { deep: true });
 watch(() => state.test, (t) => writeStored(TEST_KEY, t), { deep: true });
 
 /** A parsed condition; `remote` ones are answered by the proxy under `key`. */
@@ -687,14 +692,42 @@ export function toggleSort(key: string): void {
  * `receive` on its way to the client. It is recorded like any other frame,
  * because it is one — the peer cannot tell it from traffic.
  */
-export async function sendWsFrame(dir: 'send' | 'receive', data: string): Promise<void> {
+export const wsBusy = ref(false);
+export const wsStatus = ref('');
+export async function sendWsFrame(dir: 'send' | 'receive', data: string, binary = false): Promise<void> {
   const id = state.selected;
-  if (id === null || !data) return;
-  const answer = await reach(() => api.wsSend(id, dir, data));
+  if (id === null || wsBusy.value) return;
+  wsBusy.value = true;
+  const answer = await reach(() => api.wsSend(id, dir, data, binary));
+  wsBusy.value = false;
+  if (state.selected !== id) return;
+  wsStatus.value = answer?.ok ? 'Frame sent' : answer?.error || 'Could not reach the proxy';
   if (answer?.ok) {
-    state.wsCompose = '';
+    if (state.wsCompose === data) state.wsCompose = '';
     await loadFrames(id);
   }
+}
+
+export async function setWsMode(dir: 'send' | 'receive', mode: 'pass' | 'pause' | 'ignore'): Promise<void> {
+  const id = state.selected;
+  if (id === null || wsBusy.value) return;
+  framesLoadVersion++;
+  wsBusy.value = true;
+  const answer = await reach(() => api.controlWs(id, dir, mode));
+  wsBusy.value = false;
+  if (state.selected !== id) return;
+  wsStatus.value = answer?.ok ? `${dir}: ${mode}` : answer?.error || 'Control failed';
+  await loadFrames(id);
+}
+
+export async function disconnectWs(): Promise<void> {
+  const id = state.selected;
+  if (id === null) return;
+  framesLoadVersion++;
+  const answer = await reach(() => api.abortWs(id));
+  if (state.selected !== id) return;
+  wsStatus.value = answer?.ok ? 'Disconnected' : answer?.error || 'Disconnect failed';
+  await loadFrames(id);
 }
 
 /**
@@ -747,15 +780,17 @@ export async function testCurrentRules(): Promise<void> {
   if (typeof text === 'string') state.test.rules = text;
 }
 
+let framesLoadVersion = 0;
 export async function loadFrames(id: number): Promise<void> {
+  const version = ++framesLoadVersion;
   const list = await reach(() => api.frames(id));
-  if (state.selected !== id || !list) return;
+  if (state.selected !== id || version !== framesLoadVersion || !list) return;
   // `/frames.json` answers newest-first; a conversation reads oldest-first.
   state.frames = list.slice().reverse();
   // Whether a direction is being held has to be asked for separately: a pause
   // that has caught nothing yet is invisible in the frames themselves.
   const pause = await reach(() => api.wsPause(id));
-  if (state.selected === id && pause) state.wsPause = pause;
+  if (state.selected === id && version === framesLoadVersion && pause) state.wsPause = pause;
 }
 
 /**
@@ -768,9 +803,13 @@ export async function loadFrames(id: number): Promise<void> {
  */
 export async function releaseWsDir(dir: 'send' | 'receive'): Promise<void> {
   const id = state.selected;
-  if (id === null) return;
+  if (id === null || wsBusy.value) return;
+  framesLoadVersion++;
+  wsBusy.value = true;
   const res = await reach(() => api.releaseWs(id, dir));
-  if (!res) return;
+  wsBusy.value = false;
+  if (!res || state.selected !== id) return;
+  wsStatus.value = res.ok ? `${dir}: pass` : res.error || 'Release failed';
   flashNote(
     res.ok ? `Released ${res.released ?? 0} held ${dir} frame(s)` : res.error || 'Release failed',
   );
@@ -876,9 +915,6 @@ export async function copyText(text: string, note: string): Promise<void> {
 
 // ── composer ───────────────────────────────────────────────────────────────
 
-/** The bytes a string will actually be sent as, which is what `sent` counts. */
-const byteLength = (text: string): number => new TextEncoder().encode(text).length;
-
 /**
  * Open a captured request in the Composer, ready to be edited and sent again.
  *
@@ -891,41 +927,80 @@ const byteLength = (text: string): number => new TextEncoder().encode(text).leng
  * the proxy from the URL and the body as they stand when Send is pressed, so
  * seeding them would only offer a stale number to edit.
  */
-export function composeFrom(s: SessionSummary, d: SessionDetail | null): void {
+export const composeLoading = ref(false);
+export const composeSending = ref(false);
+let compositionVersion = 0;
+
+export async function composeFrom(s: SessionSummary, d: SessionDetail | null): Promise<void> {
+  const version = ++compositionVersion;
   state.compose = {
-    method: s.method,
-    url: s.url,
-    headers: (d?.req_headers ?? [])
-      .filter(([name]) => !/^(content-length|host)$/i.test(name))
-      .map(([name, value]) => `${name}: ${value}`)
-      .join('\n'),
-    // A binary body's `text` is its `[binary, N bytes]` marker; seeded, the
-    // Composer would send that sentence as the body.
-    body: d?.req_body?.binary ? '' : (d?.req_body?.text ?? ''),
+    method: s.method, url: s.url,
+    headers: '', body: '', body_encoding: 'base64',
+    // Until the matching detail arrives, never seed another row's headers.
+    body_incomplete: true,
   };
-  // A capture is a capped preview, so what is seeded is not always what was
-  // sent. Saying so is the point: a composition silently missing 190 KB of a
-  // 200 KB upload would come back 200 and be read as proof the endpoint works.
-  const body = d?.req_body;
-  let status = `Seeded from #${s.id}`;
-  if (body?.binary && body.len > 0) {
-    status += ` · its ${fmtBytes(body.len)} binary body was left out; the Composer sends text`;
-  } else if (body?.undecodable) {
-    status += ' · its body would not decode, so what is here is only what came out before it broke';
-  } else if (body?.truncated) {
-    status += ` · the capture held ${fmtBytes(byteLength(body.text))} of a ${fmtBytes(body.len)} body`;
-  }
-  state.composeStatus = status;
+  state.composeStatus = `Loading body from #${s.id}…`;
+  composeLoading.value = true;
   showPane('composer');
+  try {
+    const detail = d?.id === s.id ? d : await api.session(s.id);
+    if (version !== compositionVersion) return;
+    if (!detail) throw new Error('Session unavailable');
+    state.compose.headers = (detail.req_headers ?? [])
+      .filter(([name]) => !name.startsWith(':') && !/^(content-length|host|transfer-encoding|content-encoding)$/i.test(name))
+      .map(([name, value]) => `${name}: ${value}`).join('\n');
+    state.compose.body_incomplete = !!detail.req_body && (!!detail.req_body.truncated || !!detail.req_body.undecodable || !!detail.open);
+    if (detail.req_body) {
+      const body = await api.bodyBytes(s.id, 'req');
+      if (version !== compositionVersion) return;
+      state.compose.body = base64Of(body.bytes);
+      state.compose.body_incomplete ||= body.truncated;
+    }
+    state.composeStatus = `Seeded from #${s.id} · exact retained body bytes; framing headers recalculated`;
+  } catch {
+    if (version === compositionVersion) {
+      state.compose.body_incomplete = true;
+      state.composeStatus = 'Could not load the body; load a complete body file before sending';
+    }
+  } finally { if (version === compositionVersion) composeLoading.value = false; }
+}
+
+export async function loadCompositionFile(file: File): Promise<void> {
+  const version = ++compositionVersion;
+  composeLoading.value = true;
+  try {
+    const body = await bodyFile(file);
+    if (version !== compositionVersion) return;
+    state.compose.body = body;
+    state.compose.body_encoding = 'base64';
+    state.compose.body_incomplete = false;
+    state.compose.allow_partial = false;
+    if (!/^content-type:/im.test(state.compose.headers)) state.compose.headers += `${state.compose.headers ? '\n' : ''}Content-Type: ${file.type || 'application/octet-stream'}`;
+    state.composeStatus = `Loaded ${file.name} · ${fmtBytes(file.size)}`;
+  } catch (e) {
+    if (version === compositionVersion) state.composeStatus = e instanceof Error ? e.message : 'File load failed';
+  } finally { if (version === compositionVersion) composeLoading.value = false; }
+}
+
+export function compositionEncoding(encoding: 'utf8' | 'base64'): void {
+  if (composeLoading.value || (state.compose.body_encoding || 'utf8') === encoding) return;
+  try {
+    state.compose.body = encoding === 'base64'
+      ? base64Of(new TextEncoder().encode(state.compose.body))
+      : new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytesOf(state.compose.body));
+    state.compose.body_encoding = encoding;
+  } catch { state.composeStatus = 'Cannot convert this body to the selected encoding; keep Base64 for binary or raw multipart'; }
 }
 
 /** Load one of the sent compositions back into the editor. */
 export function useComposition(c: Composition): void {
+  compositionVersion++; composeLoading.value = false;
   state.compose = { ...c };
   state.composeStatus = '';
 }
 
 export function newComposition(): void {
+  compositionVersion++; composeLoading.value = false;
   state.compose = blankComposition();
   state.composeStatus = '';
 }
@@ -933,12 +1008,12 @@ export function newComposition(): void {
 /** Put a composition at the head of the history, deduplicated as upstream's is. */
 function remember(c: Composition): void {
   const same = (h: Composition) =>
-    h.method === c.method && h.url === c.url && h.headers === c.headers && h.body === c.body;
+    h.method === c.method && h.url === c.url && h.headers === c.headers && h.body === c.body && (h.body_encoding || 'utf8') === (c.body_encoding || 'utf8') && !!h.body_incomplete === !!c.body_incomplete;
   state.composeHistory = [c, ...state.composeHistory.filter((h) => !same(h))].slice(
     0,
     COMPOSE_HISTORY_MAX,
   );
-  writeStored(COMPOSE_HISTORY_KEY, state.composeHistory);
+  writeStored(COMPOSE_HISTORY_KEY, state.composeHistory.map(storedComposition));
 }
 
 /**
@@ -950,6 +1025,8 @@ function remember(c: Composition): void {
  * test rules and not merely a second curl.
  */
 export async function sendComposition(): Promise<void> {
+  if (composeLoading.value || composeSending.value) return;
+  if (state.compose.body_incomplete && !state.compose.allow_partial) { state.composeStatus = 'Load a complete body or explicitly allow the captured prefix'; return; }
   const sending = { ...state.compose };
   if (!sending.url.trim()) {
     state.composeStatus = 'A URL is required';
@@ -958,7 +1035,9 @@ export async function sendComposition(): Promise<void> {
   // Everything already captured, so the request this one becomes can be told
   // apart from the traffic that was there before it.
   const before = state.sessions.reduce((max, s) => Math.max(max, s.id), 0);
+  composeSending.value = true;
   const res = await reach(() => api.compose(sending));
+  composeSending.value = false;
   if (!res) {
     state.composeStatus = 'Could not reach the proxy';
     return;

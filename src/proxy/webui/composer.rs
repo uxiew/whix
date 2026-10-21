@@ -46,8 +46,16 @@ pub(super) async fn replay_session(
             "no session with that id is held; it may have left the list or been cleared",
         );
     }
+    if sessions.iter().any(|s| {
+        s.is_imported_har()
+            && !matches!(replay_body_of(s), ReplayBody::Whole(_) | ReplayBody::Empty)
+    }) {
+        return refused(
+            "imported request body is incomplete; load a complete body in Composer before sending",
+        );
+    }
 
-    let port = state.config.port;
+    let port = state.proxy_addr();
     let replayed = sessions.len();
     // What each replay will actually carry, decided *here* rather than inside
     // the spawned task, so the answer can report it. A replay is fire-and-forget
@@ -154,10 +162,10 @@ pub(super) fn is_dropped_header(name: &str) -> bool {
 /// Send a captured session's request through the proxy's own port so it flows
 /// through the full rule-matching + forwarding pipeline again.
 pub(super) async fn do_replay(
-    proxy_port: u16,
+    proxy_addr: std::net::SocketAddr,
     sess: &Session,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    send_through_self(proxy_port, replay_request(sess, &replay_body_of(sess))).await
+    send_through_self(proxy_addr, replay_request(sess, &replay_body_of(sess))).await
 }
 
 /// Put a request on the proxy's own port, in absolute-form, and forget it.
@@ -172,12 +180,12 @@ pub(super) async fn do_replay(
 /// The response is dropped: what it was is already being recorded on the way
 /// past, and the console reads it out of the session list.
 pub(super) async fn send_through_self(
-    proxy_port: u16,
+    proxy_addr: std::net::SocketAddr,
     req: hyper::Request<DynBody>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::TcpStream;
 
-    let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let stream = TcpStream::connect(proxy_addr).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(conn);
@@ -206,6 +214,12 @@ pub(super) struct Composed {
     pub(super) headers: String,
     #[serde(default)]
     pub(super) body: String,
+    #[serde(default)]
+    pub(super) body_encoding: String,
+    #[serde(default)]
+    pub(super) body_incomplete: bool,
+    #[serde(default)]
+    pub(super) allow_partial: bool,
 }
 
 /// Send a request composed in the console's Composer through our own port.
@@ -232,9 +246,13 @@ pub(super) async fn compose_request(
         Err(e) => return refused(&e),
     };
     let url = request.uri().to_string();
-    let sent = composed.body.len();
+    let sent = request.headers()[hyper::header::CONTENT_LENGTH]
+        .to_str()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
 
-    let port = state.config.port;
+    let port = state.proxy_addr();
     tokio::spawn(async move {
         if let Err(e) = send_through_self(port, request).await {
             tracing::warn!("composed request failed: {e}");
@@ -303,6 +321,21 @@ pub(super) fn refused(error: &str) -> Response<DynBody> {
 /// Separate from [`compose_request`] so that what is sent can be asserted on
 /// without a socket — as with [`replay_request`], see the tests.
 pub(super) fn composed_request(c: &Composed) -> Result<hyper::Request<DynBody>, String> {
+    if c.body_incomplete && !c.allow_partial {
+        return Err("the body is incomplete; load the complete body or explicitly allow sending the captured prefix".into());
+    }
+    let binary = c.body_encoding == "base64";
+    let bytes = match c.body_encoding.as_str() {
+        "" | "utf8" => Bytes::copy_from_slice(c.body.as_bytes()),
+        "base64" => Bytes::from(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &c.body)
+                .map_err(|_| "body is not valid base64")?,
+        ),
+        _ => return Err("body_encoding must be utf8 or base64".into()),
+    };
+    if binary && bytes.len() > 8 * 1024 * 1024 {
+        return Err("Composer body exceeds 8 MiB".into());
+    }
     // A bare `example.com/x` means `http://example.com/x`, as everywhere else in
     // whistle (`setProtocol`, `_original/lib/util/common.js:508-510`).
     let typed = c.url.trim();
@@ -352,7 +385,7 @@ pub(super) fn composed_request(c: &Composed) -> Result<hyper::Request<DynBody>, 
             .split_once(':')
             .ok_or_else(|| format!("not a header: {line}"))?;
         let (name, value) = (name.trim(), value.trim());
-        if is_dropped_header(name) {
+        if is_dropped_header(name) && !(binary && name.eq_ignore_ascii_case("content-encoding")) {
             continue;
         }
         let n = hyper::header::HeaderName::from_bytes(name.as_bytes())
@@ -372,7 +405,6 @@ pub(super) fn composed_request(c: &Composed) -> Result<hyper::Request<DynBody>, 
         hyper::header::HeaderValue::from_str(&authority)
             .map_err(|_| format!("not a host: {authority}"))?,
     );
-    let bytes = Bytes::from(c.body.clone());
     headers.insert(hyper::header::CONTENT_LENGTH, bytes.len().into());
     headers.insert(
         hyper::header::HeaderName::from_static(super::super::COMPOSER_REQ_HEADER),
@@ -548,6 +580,9 @@ pub(super) mod composer_tests {
             url: url.into(),
             headers: headers.into(),
             body: body.into(),
+            body_encoding: String::new(),
+            body_incomplete: false,
+            allow_partial: false,
         }
     }
 

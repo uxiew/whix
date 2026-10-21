@@ -1157,3 +1157,34 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 | 文档链接、workflow YAML、`git diff --check` | 通过 |
 
 **未验证：** 本轮没有跑全量长连接网络差分、Windows／Linux 执行或远端 CI；已接入的门禁需推送后才有远端结果。没有操作用户的真实代理数据、系统代理或证书信任库。普通 Whistle 导出缺少启停状态和全局模式，新组默认关闭，不据此宣称整个原环境无条件等价；规则与 Values 的跨存储断电原子性也不作保证。
+
+## 2026-10-19 请求重放与流量调试
+
+**2026-10-21 收尾复验：** 下列全部检查重新运行并通过，包括原有编辑／迁移浏览器回归；只提交本轮修改，不推送。
+
+**完成：**
+
+- Composer 支持严格 base64、完整正文文件及二进制／multipart 的 Edit & Resend，读捕获字节而不是文本预览；保留 boundary 和正文 CRLF，重算传输长度。不完整正文默认禁发，必须载入完整文件或明确同意发片段。二进制不塞进 localStorage，刷新后不会误发空体。修复端口 `0` 下 Composer／Replay 连错自己的问题。
+- HAR 1.2 离线追加导入：标准 base64 和 Whistle 显式 base64、时区时间、请求／响应头（含 HTTP/2 伪首部）及正文；整批校验后分配新 ID，保留文件顺序，遵循捕获与存储上限。不会访问源站或触发实时观察者；来源与截断标记重启后保留。
+- WebSocket 在活动连接上分别控制 send／receive 的 Pass、Pause、Ignore；支持二进制文件／base64 手动发帧及主动 Disconnect。修复部分写入与手动发帧交错、等待锁时丢唤醒、一端结束后另一端读任务不退出的问题。Ignore 的丢弃动作不随快速切回 Pass 而丢失；过期轮询不覆盖新控制状态。
+- 新增 HAR 独立解析模块、回归测试和真实代理浏览器夹具，接入 Node 24 的 CI 门禁。复用锁定的 `time 0.3.53` 解析 RFC3339，没有升级依赖版本。
+
+**实测（macOS arm64、Rust 1.98.1、Node 24.9.0、Chrome 154.0.8037.98）：**
+
+| 检查 | 结果 |
+| --- | --- |
+| Rust `cargo test --locked --all-targets` | 1237 通过，11 个既有忽略项未跑；新增 6 个 HAR 单元、7 个 WS 控制／取消／分片／短写入单元、4 个真实进程测试 |
+| `cargo test --locked --doc` | 2 通过 |
+| Clippy `--all-targets -- -D warnings`、fmt、前端 typecheck／build | 通过，生产控制台已重新嵌入 Rust 二进制 |
+| `PLAYWRIGHT_CHANNEL=chrome npm run test:e2e:traffic --prefix ui-src -- --repeat-each=3` | 7 条用例各重复 3 次，21/21 通过；真实源站比对 multipart／二进制字节，真实 WS 两端检查 opcode、mask、丢弃、放行和断开 |
+| 原有 Rules／Values 浏览器回归、配置迁移真实代理回归 | 分别 21/21、6/6 通过 |
+| `run.js network --only ws`，分别对 Whistle 2.10.8／2.10.10 | 每版 4 个对照通过，未声明差异均为 0；原有已声明差异分别为 4／0 |
+| 文档链接、`git diff --check` | 通过 |
+
+格式核对还检查了 [Chrome DevTools HAR 导出代码](https://raw.githubusercontent.com/ChromeDevTools/devtools-frontend/main/front_end/models/har/Log.ts)：buildRequest 沿用请求头列表。导入保留伪首部，Composer 不把它们拼成普通头，已加入字节重发回归。
+
+首轮浏览器测试中的“服务端未断开”来自测试源站的 TCP half-open 行为：已收到代理 EOF，但 Node 升级 socket 没关闭自己剩余的写半边。夹具改为收到 EOF 后关闭自己的写半边，断言同时检查 EOF 和双端关闭，没有用延时或假状态掩盖问题。
+
+**边界：** 这是正文保真，不是 HTTP 线缆报文逐字节复刻；现有规则仍执行。HAR 不重建缺失 multipart、阶段 timings、实时连接／帧或未知失败阶段；不完整导入不能直接 Replay。文件／WS 单帧上限 8 MiB，HAR 16 MiB／2000 条；分片消息期间拒绝手动数据帧及跨 Ignore 切换，避免破坏边界。手动 WS 发帧仍不经过 frameScript。具体接口见 [API](API.md#诊断与执行)。
+
+**未验证：** 没有跑全量网络差分、跨平台运行或远端 CI。全部新网络测试使用临时目录与 loopback 合成流量，没有改用户的真实代理数据、系统代理或证书信任库；没有推送。

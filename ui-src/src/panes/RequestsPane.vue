@@ -4,6 +4,7 @@
 import { onMounted, ref } from 'vue';
 import DetailPanel from './DetailPanel.vue';
 import RequestTable from './RequestTable.vue';
+import HarImportButton from '../components/HarImportButton.vue';
 import {
   captureFiltering,
   captureGaps,
@@ -89,6 +90,7 @@ function onPurge(): void {
       <button class="btn" @click="onPurge">Delete history</button>
       <button class="btn" @click="loadSessions()">Reload</button>
       <button class="btn" :disabled="state.selected === null" @click="replaySelected()">Replay</button>
+      <HarImportButton />
       <label class="check"><input v-model="state.autoRefresh" type="checkbox" /> Auto refresh</label>
       <button
         class="btn"

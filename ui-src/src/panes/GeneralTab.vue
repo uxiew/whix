@@ -33,6 +33,7 @@ const http = computed<Pair[]>(() => [
 // it is now spelled as the protocol it comes from, with the real answer above
 // it and the Rules tab behind that.
 const policy = computed<Pair[]>(() => [
+  ['Source', props.session.imported ? 'Imported HAR · offline' : 'Captured traffic'],
   ['Target', props.session.target],
   ['Rules', matched.value],
   ['log:// tags', (props.session.log || []).join(', ')],

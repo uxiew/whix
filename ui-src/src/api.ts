@@ -20,6 +20,7 @@ export interface MatchedRule {
 
 /** One row of `/sessions.json`. No headers or bodies — those are per-request. */
 export interface SessionSummary {
+  imported?: boolean;
   id: number;
   /** Unix time in milliseconds when the request was received. */
   time_ms: number;
@@ -142,6 +143,7 @@ export interface BodyCapture {
 
 /** The captured bytes of one body, as `/body.bin` hands them over. */
 export interface BodyBytes {
+  truncated: boolean;
   bytes: Uint8Array;
   /** The Content-Type the proxy recorded, without its parameters. */
   type: string;
@@ -204,6 +206,7 @@ export interface WsFrame {
 
 /** One direction of `/api/ws/status`. */
 export interface WsDirPause {
+  mode?: 'pass' | 'pause' | 'ignore';
   paused: boolean;
   /** How many frames that direction is holding right now. */
   held: number;
@@ -212,8 +215,7 @@ export interface WsDirPause {
 /**
  * `/api/ws/status?id=` — whether a live WebSocket session is being held.
  *
- * `live` is false for a session that was never paused and for one that has since
- * closed alike: only a paused, running connection can be released.
+ * Every intercepted connection is controllable until it closes.
  */
 export interface WsPauseStatus {
   live: boolean;
@@ -358,6 +360,9 @@ export interface Composition {
   url: string;
   headers: string;
   body: string;
+  body_encoding?: 'utf8' | 'base64';
+  body_incomplete?: boolean;
+  allow_partial?: boolean;
 }
 
 /**
@@ -490,6 +495,7 @@ export const api = {
     if (!res.ok) throw new Error(`/body.bin: ${res.status}`);
     return {
       bytes: new Uint8Array(await res.arrayBuffer()),
+      truncated: res.headers.get('x-whix-body-truncated') === 'true',
       type: (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase(),
       // Named by the proxy rather than re-derived here, so the file a download
       // produces and the file `curl` produces have the same name.
@@ -502,6 +508,9 @@ export const api = {
   // granularity whistle has — there is no release-one-frame anywhere in it.
   releaseWs: (id: number, dir: 'send' | 'receive') =>
     postJson<OkResult & { released?: number }>('/api/ws/release', { id, dir }),
+  controlWs: (id: number, dir: 'send' | 'receive', mode: 'pass' | 'pause' | 'ignore') => postJson<OkResult>('/api/ws/control', { id, dir, mode }),
+  abortWs: (id: number) => postJson<OkResult>('/api/ws/abort', { id }),
+  importHar: (har: unknown) => postJson<OkResult & { imported: number; retained: number; evicted: number; ids: number[]; warnings: string[] }>('/api/sessions/import', har),
   /** No ids forgets everything; a list forgets exactly those sessions. */
   clearSessions: (ids?: number[]) => postJson<OkResult>('/api/sessions/clear', ids ? { ids } : {}),
   /** Clear, and delete the history persistence wrote to disk. */
@@ -514,8 +523,8 @@ export const api = {
   compose: (c: Composition) => postJson<ComposeResult>('/api/composer', c),
 
   /** Send a frame into a live WebSocket session, from the console. */
-  wsSend: (id: number, dir: 'send' | 'receive', data: string) =>
-    postJson<OkResult>('/api/ws/send', { id, dir, data }),
+  wsSend: (id: number, dir: 'send' | 'receive', data: string, binary = false) =>
+    postJson<OkResult>('/api/ws/send', { id, dir, data, type: binary ? 'binary' : 'text', encoding: binary ? 'base64' : 'utf8' }),
 
   /** Test Rules: which operators a request *would* hit, without making one. */
   explain: (q: ExplainQuery) => postJson<Explanation>('/api/explain', q),

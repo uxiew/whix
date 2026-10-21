@@ -33,6 +33,7 @@ mod bundle;
 mod composer;
 mod console_hosts;
 mod har;
+mod har_import;
 mod logs;
 mod migration;
 mod plugin_pages;
@@ -121,8 +122,11 @@ pub async fn handle(state: &Arc<AppState>, req: Request<Incoming>) -> Response<D
         ("GET", "/api/ws/status") => ws_status(state, &req),
         ("POST", "/api/ws/release") => ws_release(state, req).await,
         ("POST", "/api/ws/send") => ws_send(state, req).await,
+        ("POST", "/api/ws/control") => ws_control(state, req).await,
+        ("POST", "/api/ws/abort") => ws_abort(state, req).await,
         // Takes a body now: the console can forget just the rows it selected.
         ("POST", "/api/sessions/clear") => sessions_clear(state, req).await,
+        ("POST", "/api/sessions/import") => har_import::sessions_import(state, req).await,
         // Clear only tidies memory; this deletes what persistence wrote too.
         ("POST", "/api/sessions/purge") => sessions_purge(state).await,
         ("GET", "/api/logs") => logs_get(state, &req),

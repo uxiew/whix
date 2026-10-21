@@ -21,6 +21,7 @@ pub async fn bind(state: &Arc<AppState>) -> Result<(TcpListener, SocketAddr)> {
     let requested = SocketAddr::new(state.config.bind_ip(), state.config.port);
     let listener = TcpListener::bind(requested).await?;
     let addr = listener.local_addr().unwrap_or(requested);
+    let _ = state.bound_addr.set(addr);
     tracing::info!("whix listening on http://{addr}");
 
     // Teach the forwarding layer which addresses are *us*, so a `proxy://` rule
@@ -174,6 +175,7 @@ pub async fn accept_loop(
     listener: TcpListener,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
+    let _ = state.bound_addr.set(listener.local_addr()?);
     // The console on its own port, when `-P/--uiport` named one. Upstream
     // starts a second plain HTTP server for exactly this case and serves the UI
     // and nothing else on it (`customUIPort`, `_original/biz/init.js:8-19`);

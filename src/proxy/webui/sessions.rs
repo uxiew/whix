@@ -92,6 +92,9 @@ pub(super) fn sessions_json(state: &Arc<AppState>, query: Option<&str>) -> Respo
                 if s.composer {
                     row["composer"] = serde_json::json!(true);
                 }
+                if s.is_imported_har() {
+                    row["imported"] = serde_json::json!(true);
+                }
                 // Still receiving its response: its sizes, its body and its
                 // `error` can change. Only while it is.
                 if s.error.is_open() {
@@ -184,6 +187,9 @@ pub(super) fn session_detail_json(
     let body = match found {
         Some(s) => {
             let mut detail = serde_json::to_value(&s).unwrap_or_default();
+            if s.is_imported_har() {
+                detail["imported"] = serde_json::json!(true);
+            }
             if s.error.is_open() {
                 detail["open"] = serde_json::json!(true);
             }
@@ -270,6 +276,10 @@ pub(super) fn session_body_bytes(
         .header(hyper::header::CONTENT_TYPE, content_type)
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(
+            "x-whix-body-truncated",
+            if preview.truncated { "true" } else { "false" },
+        )
+        .header(
             hyper::header::CONTENT_DISPOSITION,
             format!(
                 "attachment; filename=\"{}\"",
@@ -354,25 +364,32 @@ pub(super) fn json_value(body: &serde_json::Value) -> Response<DynBody> {
 /// the console can act on anyway. It answers for an unknown id rather than
 /// failing, because this is what the Frames tab polls.
 ///
-/// whistle's own endpoint is the setter `/cgi-bin/socket/change-status`, which
-/// can also *start* a pause on a live session from its UI (`changeStatus`,
-/// `_original/lib/socket-mgr.js:907-918`). This port only lifts one: the hold
-/// machinery is wired up for the directions a rule named, so there is nothing
-/// for a mid-session pause to hold with.
+/// Every intercepted connection is controllable, including one initially
+/// passing traffic. The live flag clears as soon as disconnect is requested.
 pub(super) fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
     let want = query_id(req);
     let found = want.and_then(|id| state.ws_pause.lock().unwrap().get(&id).cloned());
     let dir = |d: Option<&crate::proxy::ws::DirPause>| match d {
-        Some(d) => serde_json::json!({ "paused": d.paused(), "held": d.held() }),
-        None => serde_json::json!({ "paused": false, "held": 0 }),
+        Some(d) => {
+            let mode = d.mode();
+            serde_json::json!({ "paused": mode == crate::proxy::ws::DirMode::Pause, "held": d.held(), "mode": mode.label() })
+        }
+        None => serde_json::json!({ "paused": false, "held": 0, "mode": "pass" }),
     };
     // `live` used to mean "somebody is holding this one", because a pause was
     // the only reason to register a session. It now means what it says: the
     // connection is open, which is also what decides whether a frame can be
     // sent into it.
-    let open = want.is_some_and(|id| state.ws_write.lock().unwrap().contains_key(&id));
+    let open = want.is_some_and(|id| {
+        state
+            .ws_write
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|w| w.live())
+    });
     let body = serde_json::json!({
-        "live": open || found.is_some(),
+        "live": open,
         "send": dir(found.as_ref().map(|p| &p.send)),
         "receive": dir(found.as_ref().map(|p| &p.receive)),
     });
@@ -403,7 +420,10 @@ pub(super) async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) ->
     let Some(gate) = pause.dir(name) else {
         return json_error("dir must be \"send\" or \"receive\"");
     };
-    let released = gate.release();
+    let released = gate.held();
+    if let Err(error) = gate.set_mode(crate::proxy::ws::DirMode::Pass) {
+        return json_error(error);
+    }
     tracing::info!("released {released} held {name} frame(s) of session {id}");
     json_value(&serde_json::json!({ "ok": true, "released": released }))
 }
@@ -431,26 +451,114 @@ pub(super) async fn ws_send(state: &Arc<AppState>, req: Request<Incoming>) -> Re
     if dir != "send" && dir != "receive" {
         return json_error("dir must be \"send\" or \"receive\"");
     }
-    let data = payload.get("data").and_then(|v| v.as_str()).unwrap_or("");
+    let data = match payload.get("data") {
+        None => "",
+        Some(v) => match v.as_str() {
+            Some(s) => s,
+            None => return json_error("data must be text"),
+        },
+    };
+    let binary = match payload.get("type") {
+        None => false,
+        Some(v) if v == "text" => false,
+        Some(v) if v == "binary" => true,
+        _ => return json_error("type must be text or binary"),
+    };
+    let data = match payload.get("encoding") {
+        None => data.as_bytes().to_vec(),
+        Some(v) if v == "utf8" => data.as_bytes().to_vec(),
+        Some(v) if v == "base64" => {
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data) {
+                Ok(bytes) => bytes,
+                Err(_) => return json_error("invalid base64 frame"),
+            }
+        }
+        _ => return json_error("encoding must be utf8 or base64"),
+    };
+    if data.len() > crate::proxy::ws::MAX_FRAME_BYTES {
+        return json_error("frame exceeds 8 MiB");
+    }
+    if !binary && std::str::from_utf8(&data).is_err() {
+        return json_error("text frames must be valid UTF-8");
+    }
     let found = state.ws_write.lock().unwrap().get(&id).cloned();
     let Some(writers) = found else {
         return json_error("no live WebSocket session with that id");
     };
-    if !writers.send(dir, data.as_bytes()).await {
-        return json_error("the connection would not take it");
+    let sent = if binary {
+        writers.send_binary(dir, &data).await
+    } else {
+        writers.send(dir, &data).await
+    };
+    if !sent {
+        return json_error(
+            "connection closed, blocked, or inside a fragmented message; frame not sent",
+        );
     }
     // Recorded like any other frame, because it is one — the direction says
     // where it went, and the console shows it in the same list.
-    state.record_frame(crate::proxy::WsFrame::console_frame(
-        id,
-        dir,
-        data.as_bytes(),
-    ));
+    state.record_frame(if binary {
+        crate::proxy::WsFrame::new(id, if dir == "send" { "send" } else { "receive" }, 2, &data)
+    } else {
+        crate::proxy::WsFrame::console_frame(id, dir, &data)
+    });
     tracing::info!(
         "console sent {} bytes into session {id} ({dir})",
         data.len()
     );
     json_value(&serde_json::json!({ "ok": true, "sent": data.len() }))
+}
+
+pub(super) async fn ws_control(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let input = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(id) = input["id"].as_u64() else {
+        return json_error("id is required");
+    };
+    let Some(mode) = input["mode"]
+        .as_str()
+        .and_then(crate::proxy::ws::DirMode::parse)
+    else {
+        return json_error("mode must be pass, pause or ignore");
+    };
+    if !state
+        .ws_write
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|w| w.live())
+    {
+        return json_error("no live WebSocket session with that id");
+    }
+    let pause = state.ws_pause.lock().unwrap().get(&id).cloned();
+    let Some(pause) = pause else {
+        return json_error("no live WebSocket session with that id");
+    };
+    let Some(gate) = input["dir"].as_str().and_then(|d| pause.dir(d)) else {
+        return json_error("dir must be send or receive");
+    };
+    if let Err(error) = gate.set_mode(mode) {
+        return json_error(error);
+    }
+    json_ok()
+}
+
+pub(super) async fn ws_abort(state: &Arc<AppState>, req: Request<Incoming>) -> Response<DynBody> {
+    let input = match read_json_body(req).await {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    let Some(id) = input["id"].as_u64() else {
+        return json_error("id is required");
+    };
+    let writers = state.ws_write.lock().unwrap().get(&id).cloned();
+    let closed = writers.as_ref().is_some_and(|w| w.live());
+    if let Some(writers) = writers {
+        writers.abort();
+    }
+    json_value(&serde_json::json!({"ok":true,"closed":closed}))
 }
 
 /// The `?id=<n>` a per-session endpoint takes.

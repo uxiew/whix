@@ -47,13 +47,13 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8899/api/replay -d '{"id": 999999
 | `GET /sessions.json` | 会话摘要列表，新的在前，不带请求头和 body。可带 `after`、`ids` 当游标用，见下文 |
 | `GET /session.json?id=N` | 单个会话详情，含请求/响应头和 body 预览；查不到是 `null` |
 | `GET /api/sessions/search?c=h:…&c=b:…` | 在代理手里的全部会话里查请求/响应头（`h:`）和 body（`b:`），见下文 |
-| `GET /body.bin?id=N&side=req` / `side=res` | 已捕获体的字节；按附件返回，截断时文件名带 `partial-` |
+| `GET /body.bin?id=N&side=req` / `side=res` | 已捕获体的字节；按附件返回，截断时文件名带 `partial-`，响应头 `x-whix-body-truncated: true/false` |
 | `GET /frames.json?id=N` | 对应会话捕获的帧 |
 | `GET /sessions.har` / `?ids=1,2` | HAR 导出；来源是有界捕获，不等于完整原始报文归档，没存全的 body 会标出来 |
 
 这几条读接口其实不看方法，用 GET 就行。
 
-**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外四个字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`open: true`（响应还在传，见下文）、`unapplied`（有命中的规则没生效，见[没生效的规则](#没生效的规则)）。
+**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外这些字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`imported: true`（HAR 离线导入）、`open: true`（响应还在传，见下文）、`unapplied`（有命中的规则没生效，见[没生效的规则](#没生效的规则)）。
 
 **当游标轮询：** 列表永远是整个内存里的会话（上限 `-R`，最少 600 条）。程序要持续跟踪时：
 
@@ -245,10 +245,38 @@ curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":true}'
 | `POST /api/composer` | `{ "method": "GET", "url": "http://example.com/", "headers": "", "body": "" }`；headers 是逐行原始头文本 |
 | `POST /api/replay` | `{ "ids": [1, 2] }`；使用捕获数据，检查结果中的 body 状态 `whole/partial/empty/undecodable` |
 | `POST /api/sessions/clear` | `{ "ids": [1, 2] }` 清除指定会话；`{}` 清空列表。**只清内存**，已落盘的历史重启后会回来 |
+| `POST /api/sessions/import` | HAR 1.2 JSON，离线追加，不发请求；完整校验后才分配新 ID，见下文 |
 | `POST /api/sessions/purge` | 清空内存并删除全部会话文件；返回 `{ "ok": true, "files_deleted": N }` |
-| `GET /api/ws/status?id=N` | 当前连接的扣留/放行状态 |
+| `GET /api/ws/status?id=N` | `live`、两方向的 `mode: pass/pause/ignore`、`paused` 与 `held` |
 | `POST /api/ws/release` | `{ "id": 1, "dir": "send" }`；方向为 send/receive，按该方向批量放行 |
 | `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；确实向活动连接发送数据 |
+| `POST /api/ws/control` | `{ "id": 1, "dir": "send", "mode": "pause" }`；send/receive 分别控制，mode 为 pass/pause/ignore |
+| `POST /api/ws/abort` | `{ "id": 1 }`；立即断开两端，不等 Close 握手；重复调用返回 `closed: false` |
+
+### 二进制与 multipart 重发
+
+Composer 的 `body_encoding` 默认 `utf8`；传 `"base64"` 时严格解码 `body`，最多 **8 MiB 解码后字节**。返回的 `sent` 是实际正文字节数。原始二进制模式保留调用者提供的 `Content-Encoding`；文本模式保持原来的解码正文语义。两种模式都重新计算长度与传输分帧。
+
+控制台可 **Load body file**（完整原始正文，不是单独抽出的附件）或 **Edit & Resend**。multipart 必须保留正文原有 CRLF、二进制片段和 `Content-Type` 的 boundary；不解析后重组表单。Edit & Resend 读取 `/body.bin` 而不是文本预览，捕获体已解压，因此移除旧的 `Content-Encoding`、`Content-Length`、`Transfer-Encoding` 和 Host。**这是正文保真，不是 HTTP 线缆报文逐字节复刻**；规则仍会执行。
+
+捕获不完整或读取失败时，`body_incomplete: true` 默认拒发；只有明确传 `allow_partial: true`（UI 勾选“Send retained bytes anyway”）才发送保留片段。载入完整文件可解除限制。二进制正文只保留在当前页面内存，不写入浏览器 localStorage；刷新后必须重新载入，不能误发空体。代理会话历史仍按现有持久化策略保存。
+
+### HAR 离线会话导入
+
+Requests 的 **Import HAR** 在确认后追加导入。文件与请求体上限 **16 MiB**、最多 **2000 条**，任一条校验失败则整批不写入。返回 `{ok, imported, retained, evicted, ids, warnings}`；ID 重新分配，按文件顺序追加，不覆盖同 ID 的旧会话。重复导入会得到新记录，不去重。遵守现有内存容量、正文预览上限与磁盘保留策略；超量会淘汰旧内存行，确认前应按需导出备份。
+
+支持时间（含时区）、总耗时、URL、方法、状态、请求／响应头和正文。HTTP/2 伪首部保留供查看，重发时由 URL／方法重建，不当成普通 HTTP 头发送。支持标准 `content.encoding: "base64"`、请求 `postData.encoding: "base64"` 扩展，以及 Whistle 的 `postData.base64`／`content.base64`（优先于展示文本）。不会再次对 HAR 已解码正文解压。仅有 multipart `params` 不重建正文；缺失、截断、超预览上限或无法确定原字节编码的正文均显示警告，导入后的不完整请求不能直接 Replay。
+
+导入不访问源站、不执行规则／插件、不触发实时 `on_session` 观察者。列表与详情带 `imported: true`，再次导出带 `_imported: true`；有持久化时重启后仍保留来源。HAR 的 pages、cache、cookies 结构、阶段 timings、源站 IP、源 `_target` 和实时帧不导入；`_error` 只提示，不猜成某个实时失败阶段。总耗时保留，不凭空生成阶段时间线。要实际发送，需另行 Composer／Replay。
+
+### WebSocket 实时控制
+
+所有正在拦截的 WebSocket 都能实时切换方向状态，不要求事先写暂停规则。Pause 扣留，Pass 按原顺序放行，Ignore 丢弃该方向的数据帧及此前扣留队列；快速 Ignore → Pass 也不会复活丢弃的帧。状态改变在当前处理中的完整帧之后生效。控制帧仍维持协议运行，Pause 会扣留控制帧；切到 Ignore 时旧队列一起丢弃。
+
+`/api/ws/send` 可加 `type: "binary", encoding: "base64"`，data 是严格 base64；默认仍为 UTF-8 文本。允许空帧。单帧最多 **8 MiB**，超过上限的入站帧会关闭连接；队列使用原有有界背压。手动发帧跳过暂停／忽略并使用正确方向的 mask；不经过 frameScript（既有差异）。UI 支持选择 Binary 和 Load frame file。
+
+正在转发分片消息时，拒绝插入手动数据帧或进入／退出 Ignore，避免破坏消息边界；可恢复 Pause 等待完整消息结束，或主动 Disconnect。写入超时／传输失败会中止连接；主动断开会取消两方向任务并清理注册项，已关闭 ID 不能继续发帧。
+
 
 ## 页面日志
 

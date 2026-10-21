@@ -22,10 +22,8 @@ pub struct AppState {
     pub sessions: Mutex<VecDeque<Session>>,
     /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
     pub ws_frames: Mutex<VecDeque<WsFrame>>,
-    /// The live WebSocket sessions a rule paused, so the console can find one
-    /// and let it go again. Only `enable://pauseSend|pauseReceive` puts an entry
-    /// here, and the tunnel removes its own when it ends, so this holds exactly
-    /// the connections someone is waiting on — see [`ws::SessionPause`].
+    /// Per-direction pass/pause/ignore controls for every live intercepted
+    /// connection. Registered with its writers and removed when the tunnel ends.
     pub ws_pause: Mutex<HashMap<u64, Arc<ws::SessionPause>>>,
     /// The live WebSocket sessions the console can write into — one entry per
     /// intercepted connection, removed when it ends.
@@ -45,6 +43,8 @@ pub struct AppState {
     /// the switch away.
     pub(super) intercept_https: AtomicBool,
     pub(super) next_id: AtomicU64,
+    /// Composer/Replay must use the actual listener, including ephemeral port 0.
+    pub(super) bound_addr: std::sync::OnceLock<SocketAddr>,
     /// Optional session persistence (JSONL on disk).
     pub(super) session_store: Option<persist::SessionStore>,
     /// Told about every completed transaction, for a program that has embedded
@@ -58,6 +58,21 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(super) fn proxy_addr(&self) -> SocketAddr {
+        let mut addr = self
+            .bound_addr
+            .get()
+            .copied()
+            .unwrap_or_else(|| SocketAddr::new(self.config.bind_ip(), self.config.port));
+        if addr.ip().is_unspecified() {
+            addr.set_ip(if addr.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+        }
+        addr
+    }
     /// Construct fresh server state with a default plugin registry (built-ins +
     /// any `--plugin name=host:port` remotes from the config).
     pub fn new(config: Config, rules: RuleManager, ca: Arc<CertAuthority>) -> Self {
@@ -101,6 +116,7 @@ impl AppState {
             page_logs: Mutex::new(pagelog::PageLogs::default()),
             intercept_https,
             next_id: AtomicU64::new(1),
+            bound_addr: std::sync::OnceLock::new(),
             session_store: None,
             observer: std::sync::OnceLock::new(),
             dir_lock: None,
@@ -269,6 +285,27 @@ impl AppState {
             q.pop_front();
         }
         q.push_back(session);
+    }
+
+    /// Append offline records without running rules, plugins or observers.
+    pub(super) fn import_sessions(&self, sessions: Vec<Session>) -> (Vec<u64>, usize, usize) {
+        let mut q = self.sessions.lock().unwrap();
+        let before = q.len();
+        let count = sessions.len();
+        let cap = self.config.req_cache_size.max(1);
+        let mut ids = Vec::with_capacity(count);
+        for mut session in sessions {
+            session.id = self.reserve_id();
+            ids.push(session.id);
+            if let Some(store) = &self.session_store {
+                store.persist(&session);
+            }
+            while q.len() >= cap {
+                q.pop_front();
+            }
+            q.push_back(session);
+        }
+        (ids, count.min(cap), (before + count).saturating_sub(cap))
     }
 
     /// Hand a finished transaction to the observer and to the history on disk.

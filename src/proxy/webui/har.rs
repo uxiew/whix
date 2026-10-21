@@ -158,6 +158,9 @@ pub(super) fn har_entry(s: &Session) -> serde_json::Value {
     if let Some(n) = s.timings.as_ref().and_then(|t| t.connection_id()) {
         entry["connection"] = n.to_string().into();
     }
+    if s.is_imported_har() {
+        entry["_imported"] = true.into();
+    }
     entry
 }
 

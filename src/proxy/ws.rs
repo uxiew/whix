@@ -55,6 +55,8 @@ const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 /// The answer to one, or an unsolicited heartbeat.
 const OPCODE_PONG: u8 = 0xa;
+/// Bound allocation before reading a payload, including a paused reader.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// `Sec-WebSocket-Accept` for a client's key (RFC 6455 §4.2.2): SHA-1 of the key
 /// and the protocol's fixed GUID, base64.
@@ -93,10 +95,21 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     } else if len7 == 127 {
         let mut b = [0u8; 8];
         r.read_exact(&mut b).await?;
-        u64::from_be_bytes(b) as usize
+        usize::try_from(u64::from_be_bytes(b)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket frame length overflow",
+            )
+        })?
     } else {
         len7
     };
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebSocket frame exceeds 8 MiB",
+        ));
+    }
     let mut key = [0u8; 4];
     if masked {
         r.read_exact(&mut key).await?;
@@ -123,6 +136,12 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     payload: &[u8],
     mask: bool,
 ) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WebSocket frame exceeds 8 MiB",
+        ));
+    }
     let mut buf = Vec::with_capacity(payload.len() + 14);
     buf.push((if fin { 0x80 } else { 0 }) | (opcode & 0x0f));
     let mlen = payload.len();
@@ -257,15 +276,8 @@ pub async fn capturing_tunnel<A, B>(
     // dialling the plugins now overlaps with the client composing its first
     // frame instead of delaying the handshake.
     let (send_hooks, receive_hooks) = plan.connect(&state.plugins, session).await;
-    // A session a rule paused is announced to the console, which is the only
-    // thing that can let it go again. Nothing else is registered: a pause is
-    // rare, and the registry is meant to answer "which connections is somebody
-    // holding", not "which connections exist".
-    let pause = flow.holds().then(|| {
-        let gate = Arc::new(SessionPause::new(flow));
-        state.ws_pause.lock().unwrap().insert(session, gate.clone());
-        gate
-    });
+    // Every live connection can change direction modes at runtime.
+    let pause = Some(Arc::new(SessionPause::new(flow)));
     // The script is evaluated here, once, for the life of the connection — as
     // upstream evaluates it (`getFrameCtx`). What it sends while it is being
     // evaluated — `ctx.sendToServer` / `ctx.sendToClient` at the top of the
@@ -285,53 +297,95 @@ pub async fn capturing_tunnel<A, B>(
     // A `Mutex` rather than a channel: a frame is written whole while the lock
     // is held, so an injected one can never interleave with a relayed one, and
     // the ordinary path pays one uncontended lock per frame.
-    let writers = Arc::new(SessionWriters::new(uw, cw));
+    let mut writers = SessionWriters::new(uw, cw);
+    writers.pause = pause.clone();
+    let writers = Arc::new(writers);
     state
         .ws_write
         .lock()
         .unwrap()
         .insert(session, writers.clone());
+    state
+        .ws_pause
+        .lock()
+        .unwrap()
+        .insert(session, pause.as_ref().unwrap().clone());
     let (uw, cw) = (writers.to_server(), writers.to_client());
-    let up = tokio::spawn(pump(
-        cr,
-        uw,
-        Leg {
-            dir: Dir::Send,
-            script: script.clone(),
-            hooks: send_hooks,
-            mode: flow.send,
-            pause: pause.clone(),
-            // This leg writes toward the server, so its keep-alive is the pong.
-            keepalive: !flow.no_pong,
-            inject: inject_send,
-            writers: writers.clone(),
-        },
-        state.clone(),
+    let registration = Registration {
+        state: state.clone(),
         session,
-    ));
-    let down = tokio::spawn(pump(
-        ur,
-        cw,
-        Leg {
-            dir: Dir::Receive,
-            script,
-            hooks: receive_hooks,
-            mode: flow.receive,
-            pause: pause.clone(),
-            // …and this one writes toward the client, so it is the ping.
-            keepalive: !flow.no_ping,
-            inject: inject_receive,
-            writers: writers.clone(),
-        },
-        state.clone(),
-        session,
-    ));
-    let _ = tokio::join!(up, down);
-    if pause.is_some() {
-        state.ws_pause.lock().unwrap().remove(&session);
+        writers: writers.clone(),
+    };
+    let mut closed = writers.closed.subscribe();
+    {
+        let up = pump(
+            cr,
+            uw,
+            Leg {
+                dir: Dir::Send,
+                script: script.clone(),
+                hooks: send_hooks,
+                mode: flow.send,
+                pause: pause.clone(),
+                // This leg writes toward the server, so its keep-alive is the pong.
+                keepalive: !flow.no_pong,
+                inject: inject_send,
+                writers: writers.clone(),
+            },
+            state.clone(),
+            session,
+        );
+        let down = pump(
+            ur,
+            cw,
+            Leg {
+                dir: Dir::Receive,
+                script,
+                hooks: receive_hooks,
+                mode: flow.receive,
+                pause: pause.clone(),
+                // …and this one writes toward the client, so it is the ping.
+                keepalive: !flow.no_ping,
+                inject: inject_receive,
+                writers: writers.clone(),
+            },
+            state.clone(),
+            session,
+        );
+        tokio::pin!(up, down);
+        tokio::select! { _ = &mut up => {}, _ = &mut down => {}, _ = closed.wait_for(|v| *v) => {} }
     }
-    // The connection is over; nothing may be written into it any more.
-    state.ws_write.lock().unwrap().remove(&session);
+    writers.abort();
+    drop(registration);
+}
+
+struct Registration {
+    state: Arc<AppState>,
+    session: u64,
+    writers: Arc<SessionWriters>,
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.writers.abort();
+        self.state.ws_pause.lock().unwrap().remove(&self.session);
+        self.state.ws_write.lock().unwrap().remove(&self.session);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let writers = self.writers.clone();
+            runtime.spawn(async move {
+                // Drop the socket halves even if a stale API handle still owns
+                // the registry object. Abort wakes pending injected writes.
+                *writers.to_server.lock().await = Box::new(tokio::io::sink());
+                *writers.to_client.lock().await = Box::new(tokio::io::sink());
+            });
+        }
+    }
+}
+
+struct ReaderTask(tokio::task::JoinHandle<()>);
+impl Drop for ReaderTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// The two write halves of a live WebSocket session, shared with the console.
@@ -347,6 +401,8 @@ pub async fn capturing_tunnel<A, B>(
 pub struct SessionWriters {
     to_server: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     to_client: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    closed: tokio::sync::watch::Sender<bool>,
+    pause: Option<Arc<SessionPause>>,
 }
 
 impl SessionWriters {
@@ -358,18 +414,24 @@ impl SessionWriters {
         SessionWriters {
             to_server: Arc::new(tokio::sync::Mutex::new(Box::new(to_server))),
             to_client: Arc::new(tokio::sync::Mutex::new(Box::new(to_client))),
+            closed: tokio::sync::watch::channel(false).0,
+            pause: None,
         }
     }
 
     fn to_server(&self) -> SharedWriter {
         SharedWriter {
             inner: self.to_server.clone(),
+            locking: None,
+            guard: None,
         }
     }
 
     fn to_client(&self) -> SharedWriter {
         SharedWriter {
             inner: self.to_client.clone(),
+            locking: None,
+            guard: None,
         }
     }
 
@@ -380,12 +442,27 @@ impl SessionWriters {
     /// way to the client. The frame is masked exactly as a real one from that
     /// side would be, so neither end can tell it apart from traffic.
     pub async fn send(&self, dir: &str, data: &[u8]) -> bool {
+        self.send_payload(dir, OPCODE_TEXT, data).await
+    }
+
+    pub async fn send_binary(&self, dir: &str, data: &[u8]) -> bool {
+        self.send_payload(dir, OPCODE_BINARY, data).await
+    }
+
+    pub fn live(&self) -> bool {
+        !*self.closed.borrow()
+    }
+    pub fn abort(&self) {
+        self.closed.send_replace(true);
+    }
+
+    async fn send_payload(&self, dir: &str, opcode: u8, data: &[u8]) -> bool {
         let to_server = match dir {
             "send" => true,
             "receive" => false,
             _ => return false,
         };
-        self.send_frame(to_server, OPCODE_TEXT, data).await
+        self.send_frame(to_server, opcode, data).await
     }
 
     /// Write one whole frame toward either end, holding that end's lock for
@@ -397,10 +474,27 @@ impl SessionWriters {
         } else {
             &self.to_client
         };
-        let mut w = half.lock().await;
-        write_frame(&mut *w, true, opcode, data, to_server)
-            .await
-            .is_ok()
+        let mut closed = self.closed.subscribe();
+        if *closed.borrow() {
+            return false;
+        }
+        let result = tokio::select! {
+            _ = closed.wait_for(|v| *v) => false,
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut w = half.lock().await;
+                if self.pause.as_ref().is_some_and(|p| p.of(if to_server {Dir::Send} else {Dir::Receive}).fragmented()) {
+                    return Ok(false);
+                }
+                write_frame(&mut *w, true, opcode, data, to_server).await.map(|()| true)
+            }) => match result {
+                Ok(Ok(sent)) => return sent,
+                _ => false,
+            },
+        };
+        if !result {
+            self.abort();
+        }
+        result
     }
 }
 
@@ -408,6 +502,28 @@ impl SessionWriters {
 /// ordinary `AsyncWrite` that happens to be shared.
 struct SharedWriter {
     inner: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    locking: Option<std::pin::Pin<Box<dyn std::future::Future<Output = WriterGuard> + Send>>>,
+    guard: Option<WriterGuard>,
+}
+
+type WriterGuard = tokio::sync::OwnedMutexGuard<Box<dyn AsyncWrite + Unpin + Send>>;
+impl SharedWriter {
+    fn lock(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.guard.is_some() {
+            return std::task::Poll::Ready(());
+        }
+        let future = self
+            .locking
+            .get_or_insert_with(|| Box::pin(self.inner.clone().lock_owned()));
+        match future.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(guard) => {
+                self.locking = None;
+                self.guard = Some(guard);
+                std::task::Poll::Ready(())
+            }
+        }
+    }
 }
 
 impl AsyncWrite for SharedWriter {
@@ -417,11 +533,8 @@ impl AsyncWrite for SharedWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
-            std::task::Poll::Ready(g) => g,
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut **guard).poll_write(cx, buf)
+        std::task::ready!(this.lock(cx));
+        std::pin::Pin::new(&mut ***this.guard.as_mut().unwrap()).poll_write(cx, buf)
     }
 
     fn poll_flush(
@@ -429,11 +542,12 @@ impl AsyncWrite for SharedWriter {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
-            std::task::Poll::Ready(g) => g,
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut **guard).poll_flush(cx)
+        std::task::ready!(this.lock(cx));
+        let result = std::pin::Pin::new(&mut ***this.guard.as_mut().unwrap()).poll_flush(cx);
+        if result.is_ready() {
+            this.guard = None;
+        }
+        result
     }
 
     fn poll_shutdown(
@@ -441,11 +555,12 @@ impl AsyncWrite for SharedWriter {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut guard = match Box::pin(this.inner.lock()).as_mut().poll(cx) {
-            std::task::Poll::Ready(g) => g,
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-        };
-        std::pin::Pin::new(&mut **guard).poll_shutdown(cx)
+        std::task::ready!(this.lock(cx));
+        let result = std::pin::Pin::new(&mut ***this.guard.as_mut().unwrap()).poll_shutdown(cx);
+        if result.is_ready() {
+            this.guard = None;
+        }
+        result
     }
 }
 
@@ -506,14 +621,24 @@ impl FrameFlow {
             no_pong,
         }
     }
-
-    /// Whether either direction starts held, and so needs a console control.
-    fn holds(&self) -> bool {
-        self.send == DirMode::Pause || self.receive == DirMode::Pause
-    }
 }
 
 impl DirMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Pause => "pause",
+            Self::Ignore => "ignore",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pass" => Some(Self::Pass),
+            "pause" => Some(Self::Pause),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
     /// Pause outranks ignore, as upstream's `else if` chain does
     /// (`initStatus`, `_original/lib/socket-mgr.js:86-97`). `ignored_ws_dirs`
     /// already applies that precedence; this is where it becomes unrepresentable.
@@ -561,8 +686,9 @@ const KEEPALIVE: Duration = Duration::from_secs(22);
 /// watch a socket for an EOF you are not reading. Below the caps it still can,
 /// because it is still reading; at them, what notices is [`KEEPALIVE`] failing
 /// against the peer on the other side. A hold nobody ever lifts therefore costs
-/// one task and at most these many bytes, which is the same open-ended cost
-/// upstream's unread socket has.
+/// a bounded queue and a reader. The byte threshold can overshoot by one frame;
+/// the reader also holds at most two frames (one in the channel and one read
+/// ahead). Each is bounded by MAX_FRAME_BYTES.
 const MAX_HELD_FRAMES: usize = 64;
 /// The byte half of [`MAX_HELD_FRAMES`].
 const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
@@ -585,12 +711,8 @@ pub struct SessionPause {
 impl SessionPause {
     fn new(flow: FrameFlow) -> Self {
         let gate = SessionPause::default();
-        gate.send
-            .paused
-            .store(flow.send == DirMode::Pause, Ordering::Relaxed);
-        gate.receive
-            .paused
-            .store(flow.receive == DirMode::Pause, Ordering::Relaxed);
+        gate.send.set_mode(flow.send).expect("initial flow");
+        gate.receive.set_mode(flow.receive).expect("initial flow");
         gate
     }
 
@@ -615,15 +737,51 @@ impl SessionPause {
 /// One direction's half of a [`SessionPause`].
 #[derive(Default)]
 pub struct DirPause {
-    paused: AtomicBool,
+    flow: std::sync::Mutex<(DirMode, bool)>,
     held: AtomicUsize,
+    // Notifications can coalesce; an Ignore transition must still discard the
+    // old queue even if another API call has already returned the mode to Pass.
+    discard_held: AtomicBool,
     release: Notify,
 }
 
 impl DirPause {
     /// Whether this direction is currently holding its frames back.
     pub fn paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.mode() == DirMode::Pause
+    }
+    pub fn mode(&self) -> DirMode {
+        self.flow.lock().unwrap().0
+    }
+    pub fn fragmented(&self) -> bool {
+        self.flow.lock().unwrap().1
+    }
+    pub fn set_mode(&self, mode: DirMode) -> Result<(), &'static str> {
+        let mut flow = self.flow.lock().unwrap();
+        if flow.1 && flow.0 != mode && (mode == DirMode::Ignore || flow.0 == DirMode::Ignore) {
+            return Err(
+                "cannot enter or leave ignore during a fragmented message; resume a pause or disconnect instead",
+            );
+        }
+        flow.0 = mode;
+        if mode == DirMode::Ignore {
+            self.discard_held.store(true, Ordering::Release);
+        }
+        drop(flow);
+        self.release.notify_one();
+        Ok(())
+    }
+    fn begin_frame(&self, frame: &Frame) -> DirMode {
+        let mut flow = self.flow.lock().unwrap();
+        if !frame.fin && matches!(frame.opcode, OPCODE_TEXT | OPCODE_BINARY) {
+            flow.1 = true;
+        }
+        flow.0
+    }
+    fn end_frame(&self, fin: bool, opcode: u8) {
+        if fin && opcode == OPCODE_CONTINUATION {
+            self.flow.lock().unwrap().1 = false;
+        }
     }
 
     /// How many frames are waiting to go out.
@@ -637,10 +795,12 @@ impl DirPause {
     /// because that is the only granularity upstream has: its console sets the
     /// direction's status back to `0` and everything held goes out at once
     /// (`setConnStatus`, `_original/lib/socket-mgr.js:63-84`). A direction that
-    /// was not paused is untouched, so a second click is harmless.
+    /// already passing is unchanged, so a second click is harmless.
     pub fn release(&self) -> usize {
         let held = self.held();
-        self.paused.store(false, Ordering::Release);
+        if self.set_mode(DirMode::Pass).is_err() {
+            return 0;
+        }
         // `notify_one` and not `notify_waiters`: the leg may be between waits,
         // and only the permit-storing form survives that.
         self.release.notify_one();
@@ -666,7 +826,7 @@ struct Leg {
     hooks: Vec<FrameHook>,
     /// What `enable://` asked for this direction.
     mode: DirMode,
-    /// The console-visible pause state, when a rule paused either direction.
+    /// Runtime controls; every intercepted connection has one.
     pause: Option<Arc<SessionPause>>,
     /// False when `disable://ping` / `disable://pong` asked for no keep-alive on
     /// this leg — see [`crate::proxy::apply::ws_keepalive_disabled`].
@@ -704,9 +864,8 @@ where
         writers,
     };
     match (mode, pause) {
-        (DirMode::Pause, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive, inject).await,
-        // Everything else, which is very nearly every session: read, decide,
-        // write, with no companion task and no channel between the two.
+        (_, Some(gate)) => pump_held(r, w, ctx, gate, dir, keepalive, inject).await,
+        // Unregistered internal callers retain the direct pump.
         _ => pump_direct(r, w, ctx, inject).await,
     }
 }
@@ -925,14 +1084,14 @@ async fn pump_held<R, W>(
     write_injections(&mut w, &ctx, &inject).await;
     let gate = pause.of(dir);
     let (tx, mut rx) = mpsc::channel::<Frame>(1);
-    let reader = tokio::spawn(async move {
+    let reader = ReaderTask(tokio::spawn(async move {
         let mut r = r;
         while let Ok(Some(frame)) = read_frame(&mut r).await {
             if tx.send(frame).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     let mut held: Vec<HeldFrame> = Vec::new();
     let mut held_bytes = 0usize;
@@ -946,23 +1105,25 @@ async fn pump_held<R, W>(
     probe.tick().await;
 
     'leg: loop {
+        let discard = gate.discard_held.swap(false, Ordering::AcqRel);
+        if (discard || gate.mode() == DirMode::Ignore) && !held.is_empty() {
+            ignore_held_marks(&ctx.state, ctx.session, ctx.direction, held.len());
+            held.clear();
+            held_bytes = 0;
+            gate.held.store(0, Ordering::Release);
+        }
         // The queue empties before anything behind it goes out, wherever the
         // release happened to land — a pause that reordered the conversation it
         // was asked to hold would be worse than no pause at all.
-        if !gate.paused()
+        if gate.mode() == DirMode::Pass
             && !held.is_empty()
             && !flush(&mut w, &mut held, &mut held_bytes, &ctx, gate).await
         {
             break;
         }
         let frame = loop {
-            if !gate.paused() {
-                match rx.recv().await {
-                    Some(frame) => break frame,
-                    None => break 'leg,
-                }
-            }
-            let room = held.len() < MAX_HELD_FRAMES && held_bytes < MAX_HELD_BYTES;
+            let room =
+                !gate.paused() || (held.len() < MAX_HELD_FRAMES && held_bytes < MAX_HELD_BYTES);
             tokio::select! {
                 // A release outranks a frame that arrived with it: the queue
                 // goes first either way, and taking it first says so plainly.
@@ -977,7 +1138,7 @@ async fn pump_held<R, W>(
                 // `disable://ping` / `disable://pong` suppress the probe
                 // rather than the tick: the timer is cheap and the flag is
                 // about what goes on the wire.
-                _ = probe.tick(), if keepalive => {
+                _ = probe.tick(), if keepalive && gate.paused() => {
                     if !send_keepalive(&mut w, ctx.to_server).await {
                         break 'leg;
                     }
@@ -985,8 +1146,13 @@ async fn pump_held<R, W>(
             }
         };
         let fin = frame.fin;
-        let holding = gate.paused();
+        let original_opcode = frame.opcode;
+        ctx.mode = gate.begin_frame(&frame);
+        let holding = ctx.mode == DirMode::Pause;
         let Some((opcode, payload)) = ctx.process(frame, holding).await else {
+            if !holding {
+                gate.end_frame(fin, original_opcode);
+            }
             continue;
         };
         if holding {
@@ -998,11 +1164,12 @@ async fn pump_held<R, W>(
         if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
             break;
         }
+        gate.end_frame(fin, opcode);
     }
     // This leg is over however it ended, and the reader may still be parked on a
     // peer that is never going to speak again. Nothing is left to read what it
     // would produce, so let it go and let it drop its half of the socket with it.
-    reader.abort();
+    drop(reader);
 }
 
 /// Let a released direction's queue go, oldest first. `false` when the leg is
@@ -1021,9 +1188,17 @@ async fn flush<W: AsyncWrite + Unpin>(
 ) -> bool {
     let mut sent = 0usize;
     let mut alive = true;
-    for (fin, opcode, payload) in held.drain(..) {
+    while gate.mode() == DirMode::Pass
+        && !gate.discard_held.load(Ordering::Acquire)
+        && !held.is_empty()
+    {
+        let (fin, opcode, payload) = held.remove(0);
+        *held_bytes = held_bytes.saturating_sub(payload.len());
         match deliver(w, fin, opcode, &payload, ctx.to_server).await {
-            Sent::Ok => sent += 1,
+            Sent::Ok => {
+                sent += 1;
+                gate.end_frame(fin, opcode);
+            }
             Sent::Closed => {
                 sent += 1;
                 alive = false;
@@ -1035,10 +1210,23 @@ async fn flush<W: AsyncWrite + Unpin>(
             }
         }
     }
-    *held_bytes = 0;
     gate.held.store(held.len(), Ordering::Release);
     clear_held_marks(&ctx.state, ctx.session, ctx.direction, sent);
     alive
+}
+
+fn ignore_held_marks(state: &AppState, session: u64, direction: &str, count: usize) {
+    let mut left = count;
+    for frame in state.ws_frames.lock().unwrap().iter_mut() {
+        if left == 0 {
+            break;
+        }
+        if frame.session == session && frame.dir == direction && frame.held {
+            frame.held = false;
+            frame.ignored = true;
+            left -= 1;
+        }
+    }
 }
 
 /// Clear the `held` flag on the oldest `count` still-held captures of one
@@ -1291,6 +1479,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod control_cases;
     use super::*;
     use crate::ca::CertAuthority;
     use crate::config::Config;
@@ -2030,19 +2219,27 @@ mod tests {
         });
     }
 
-    /// A session nobody paused is not registered at all — the registry answers
-    /// "which connections is somebody holding", and an entry per WebSocket would
-    /// make it answer something else. A paused one is registered for exactly as
-    /// long as it lasts, and frames still held when it ends stay flagged: they
-    /// never reached the peer, and the capture should not pretend otherwise.
+    /// Every live connection is controllable; closed connections are removed.
     #[test]
-    fn only_a_paused_session_is_registered_and_only_while_it_lasts() {
+    fn every_session_is_registered_only_while_it_lasts() {
         rt().block_on(async {
             let state = state_with(crate::plugins::Plugins::new());
-            let plain = spawn_tunnel(&state, plan_for(&state, "ws.test resHeaders://x=1\n"), None);
-            write_frame(&mut { plain.client }, true, OPCODE_TEXT, b"hi", true)
+            let mut plain =
+                spawn_tunnel(&state, plan_for(&state, "ws.test resHeaders://x=1\n"), None);
+            write_frame(&mut plain.client, true, OPCODE_TEXT, b"hi", true)
                 .await
                 .expect("client write");
+            let plain_gate = gate_of(&state).await;
+            assert_eq!(plain_gate.send.mode(), DirMode::Pass);
+            assert_eq!(
+                read_frame(&mut plain.server)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                b"hi"
+            );
+            finish(plain).await;
             assert!(state.ws_pause.lock().unwrap().is_empty());
 
             let state = state_with(crate::plugins::Plugins::new());
