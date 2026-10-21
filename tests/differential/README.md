@@ -371,8 +371,9 @@ node run.js network --only core                        # 门禁里就是这么�
 | 组 | 问什么 | 用例数 |
 |---|---|---|
 | `regexp` | 用只有 JavaScript 正则才认的写法（先行断言、后行断言、反向引用、命名分组）写的匹配串、筛选器或替换，两边匹配结果一样，它的反例两边都不匹配 | 19 |
-| `script` | `reqScript`/`resScript` 里的辅助函数*返回*什么：`parseQuery`、`parseUrl`、`Buffer`、`iconv`、`RegExp.$1` | 55 |
-| `frame` | WebSocket 上的 `frameScript`：帧与帧之间的状态、二进制帧、会丢弃、抛异常、发送的处理函数 | 21 |
+| `script` | `reqScript`/`resScript` 里的辅助函数*返回*什么：`parseQuery`、`parseUrl`、`Buffer`、`iconv`、`RegExp.$1`，以及运行限时 | 57 |
+| `frame` | WebSocket 上的 `frameScript`：帧与帧之间的状态、二进制帧、会丢弃、抛异常、发送的处理函数及首次访问 Buffer 原型 | 22 |
+| `frame-startup` | 并发启动脚本的三条注入帧及普通帧都完整到达；默认 8 条连接，每端还独立断言预期字节，不只比较两端是否相同 | 1 |
 | `tcp` | 普通 TCP 隧道上的 `frameScript` | 7 |
 | `log` | `log://` 往页面里放一个收集器；没有这条规则的页面、纯文本里什么也不放 | 3 |
 | `mtls` | `tlsOptions://` 把客户端证书（PEM、PFX）交给源站；私钥错、CA 错、口令错都会被拒 | 9 |
@@ -381,10 +382,21 @@ node run.js network --only core                        # 门禁里就是这么�
 每个用例旁边都有一个反例；只有**源站**看到了效果，用例才算数——代理回一个 `200` 什么也证明不了。差异声明在 `declared.js` 的 `core-bench.js` 名下：六条是本项目有意为之（二进制帧保持二进制、处理函数里有 `Buffer` 和 `ctx`……），另有十条只出现在 2.10.8 上，全是上游同一个 bug，2.10.10 已经修了。跑干净时最后一行是：
 
 ```
-whistle 2.10.10 — ran: 114  differing: 0  declared: 6  stale: 0  one-sided: 4 (0 failed)
+whistle 2.10.10 — ran: 118  differing: 0  declared: 6  stale: 0  one-sided: 4 (0 failed)
 ```
 
 输出里 `DIFF` 是没有任何声明的差异，`decl` 是已声明的差异，`STALE` 是对应差异已经不再出现的声明。带 `CASES=` 跑时永远不报 stale，因为跳过的用例根本没跑，没法检查。
+
+复验脚本启动竞争时，先创建一个新的结果目录，再单独跑 `frame-startup`（下面仍在 `tests/differential/` 中执行）：
+
+```sh
+mkdir -p ../../target/differential/frame-startup-check
+CASES=frame-startup FRAME_STARTUP_CONNECTIONS=128 PORT_BASE=21900 \
+  node core-bench.js --json ../../target/differential/frame-startup-check/result.json
+```
+
+`FRAME_STARTUP_CONNECTIONS` 只控制这组连接数，必须是 1…128 的整数，默认 8；不改变脚本限时、观察窗口或其他用例。请求标签使用进程内递增序号，避免并发连接在同一毫秒共用标签。每次复验使用独立结果／状态目录保留日志；`RS_BIN` 可指定修复前后的冻结二进制。128 条连接属于手工竞争复验，不是所有机器的容量承诺，也不是 CI 默认负载。
+
 
 ## 到底对照的是哪个 whistle
 

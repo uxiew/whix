@@ -1518,6 +1518,7 @@ where
 mod tests {
     mod concurrency_cases;
     mod control_cases;
+    mod script_startup_cases;
     use super::*;
     use crate::ca::CertAuthority;
     use crate::config::Config;

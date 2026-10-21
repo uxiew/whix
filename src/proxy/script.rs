@@ -1405,6 +1405,12 @@ fn start_frame_script(
     ctx.eval(Source::from_bytes(FRAME_GLUE.as_bytes()))
         .inspect_err(|err| tracing::error!("the frame-script glue does not evaluate: {err}"))
         .ok()?;
+    // Frame dispatch always needs Buffer. Compile the trusted Node helpers
+    // before starting the user's clock: lazy loading under contention can
+    // otherwise spend that budget before even a greeting has been queued.
+    ctx.eval(Source::from_bytes(b"Buffer.alloc(0)"))
+        .inspect_err(|err| tracing::error!("the frame-script helpers do not initialize: {err}"))
+        .ok()?;
     if let Err(why) = eval_bounded(&mut ctx, &spec.src, Instant::now() + TIME_LIMIT) {
         tracing::debug!("frameScript {why}");
         return None;

@@ -33,6 +33,7 @@
 // declarations, because the cases they name were not run.
 'use strict';
 
+const assert = require('node:assert/strict');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
@@ -48,11 +49,18 @@ const [W, RS, ORIGIN, TCP, MTLS, PLUGIN] = [BASE, BASE + 1, BASE + 2, BASE + 3, 
 const RS_BIN = process.env.RS_BIN || path.join(__dirname, '..', '..', 'target', 'debug', 'whix');
 const WHISTLE = require('./whistle-pkg');
 const { judge } = require('./declared');
+// The default is small enough for CI; the bounded override reproduces startup
+// contention without slowing every other group down.
+const STARTUP_CONNECTIONS = Number(process.env.FRAME_STARTUP_CONNECTIONS || 8);
+if (!Number.isInteger(STARTUP_CONNECTIONS) || STARTUP_CONNECTIONS < 1 || STARTUP_CONNECTIONS > 128) {
+  throw new Error('FRAME_STARTUP_CONNECTIONS must be an integer in 1..128');
+}
 const STATE = process.env.DIFF_STATE || fs.mkdtempSync(path.join(os.tmpdir(), 'wrs-core-'));
 const ONLY = process.env.CASES ? new Set(process.env.CASES.split(',')) : null;
 const JSON_OUT = (() => { const i = process.argv.indexOf('--json'); return i > 0 ? process.argv[i + 1] : null; })();
 const O = `127.0.0.1:${ORIGIN}`;
 let currentCase = 'startup';
+let wsSequence = 0;
 
 // ── fixtures ────────────────────────────────────────────────────────────
 
@@ -464,7 +472,7 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   // ── frameScript ──
   const FRAME = (body) => block('f.js', body) + `${O} frameScript://{f.js}`;
   const ws = (tag, frames) => async (port) => {
-    const x = await wsVia(port, `${tag}-${port}-${Date.now()}`, frames);
+    const x = await wsVia(port, `${tag}-${port}-${++wsSequence}`, frames);
     return { handshake: x.handshake, origin: x.origin, client: x.client };
   };
   add('frame', 'state kept between the frames of one connection',
@@ -521,9 +529,25 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   add('frame', 'what a handler may return',
     FRAME(`var c = ctx;\nvar n = 0;\nc.handleSendToServerFrame = function (buf) { n++; return n === 1 ? { a: 1 } : n === 2 ? 7 : n === 3 ? 0 : n === 4 ? '' : n === 5 ? [1, 2] : undefined; };`),
     ws('returns', [{ data: '1' }, { data: '2' }, { data: '3' }, { data: '4' }, { data: '5' }, { data: '6' }]));
+  const STARTUP_SENDS = `ctx.sendToServer(Buffer.from([0x41, 0x42]), { binary: true });\nctx.sendToServer({ k: 'v' });\nctx.sendToClient('to-client');\nctx.sendToServer('');`;
   add('frame', 'frames the script sends: a Buffer, an object, options',
-    FRAME(`ctx.sendToServer(Buffer.from([0x41, 0x42]), { binary: true });\nctx.sendToServer({ k: 'v' });\nctx.sendToClient('to-client');\nctx.sendToServer('');`),
-    ws('topkinds', [{ data: 'a' }]));
+    FRAME(STARTUP_SENDS), ws('topkinds', [{ data: 'a' }]));
+  add('frame-startup', 'concurrent scripts preserve every startup injection',
+    FRAME(STARTUP_SENDS),
+    async (port) => {
+      const results = await Promise.all(Array.from({ length: STARTUP_CONNECTIONS },
+        () => ws('concurrent-startup', [{ data: 'a' }])(port)));
+      // Agreement alone is insufficient if both proxies lose the greetings.
+      for (const result of results) assert.deepEqual(result, {
+        handshake: 101,
+        origin: ['bin:AB', 'txt:{"k":"v"}', 'txt:a'],
+        client: ['txt:to-client', 'bin:AB', 'txt:{"k":"v"}', 'txt:a'],
+      }, 'startup frames through proxy ' + port);
+      return results;
+    });
+  add('frame', 'Buffer prototype is ready before the script starts',
+    FRAME(`ctx.sendToServer(typeof Buffer.prototype.writeUInt32LE);`),
+    ws('buffer-ready', []));
   add('frame', 'what the script sees while it runs',
     FRAME(`ctx.sendToServer([typeof url, typeof method, typeof headers, typeof rules, typeof values, typeof Buffer, typeof parseUrl, typeof parseQuery, typeof getValue, typeof render, typeof ctx.sendToClient, typeof ctx.frame, typeof ctx.direction].join(','));`),
     ws('topsees', []));
