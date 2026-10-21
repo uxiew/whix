@@ -1,4 +1,4 @@
-// `frameScript://` on a real WebSocket, through both proxies.
+// `frameScript://` and normal WebSocket closing handshakes, through both proxies.
 //
 //   PORT_BASE=18700 node ws-bench.js     # the pair on PORT_BASE and +1 (run.js starts it)
 //
@@ -42,12 +42,15 @@ const CASES = [
   { name: 'a frame script with both handlers', rules: script('both.js', `${TO_SERVER}\n${TO_CLIENT}`) },
   { name: 'a frame script for the client\'s frames only', rules: script('up.js', TO_SERVER) },
   { name: 'a frame script for the server\'s frames only', rules: script('down.js', TO_CLIENT) },
+  { name: 'client initiated close handshake', rules: '', close: 'client' },
+  { name: 'server initiated close handshake', rules: '', close: 'server' },
 ];
 
 // ── the origin: an echo that remembers what it was sent ──────────────────
 
 /** What the origin received, by the tag in the connection's path. */
 const received = new Map();
+const closed = new Map();
 
 function startOrigin() {
   return new Promise((resolve, reject) => {
@@ -55,6 +58,8 @@ function startOrigin() {
     const wss = new WebSocket.Server({ server });
     wss.on('connection', (ws) => {
       const tag = (ws.upgradeReq && ws.upgradeReq.url || '').split('?')[1] || '';
+      ws.on('close', (code) => closed.set(tag, code));
+      if (tag.endsWith('-close-server')) ws.close(1000);
       ws.on('message', (msg) => {
         const text = String(msg);
         received.set(tag, [...(received.get(tag) || []), text]);
@@ -72,13 +77,13 @@ function startOrigin() {
 
 // ── the client: one text frame out, one back, over a raw socket ──────────
 
-/** A masked client text frame — the framing a client must use (RFC 6455 §5.3). */
-function textFrame(text) {
+/** A masked short client frame — the framing a client must use (RFC 6455 §5.3). */
+function clientFrame(text, opcode = 1) {
   const payload = Buffer.from(text);
   if (payload.length >= 126) throw new Error('keep test frames short');
   const mask = crypto.randomBytes(4);
   const masked = Buffer.from(payload.map((b, i) => b ^ mask[i % 4]));
-  return Buffer.concat([Buffer.from([0x81, 0x80 | payload.length]), mask, masked]);
+  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | payload.length]), mask, masked]);
 }
 
 /** The first complete server frame in `buf`, or null. Servers do not mask. */
@@ -92,20 +97,22 @@ function readFrame(buf) {
     at = 4;
   }
   if (buf.length < at + len) return null;
-  return { opcode: buf[0] & 0x0f, text: buf.slice(at, at + len).toString() };
+  return { opcode: buf[0] & 0x0f, text: buf.slice(at, at + len).toString(), closeCode: len >= 2 ? buf.readUInt16BE(at) : null };
 }
 
 /**
  * Through the proxy on `port`: upgrade, send `text`, return the first text
  * frame the client gets back (or what went wrong).
  */
-function exchange(port, tag, text) {
+function exchange(port, tag, text, closing) {
   return new Promise((resolve) => {
     const socket = net.connect(port, HOST);
     let buf = Buffer.alloc(0);
     let upgraded = false;
+    let closeAnswer = '(no close frame)';
     const done = (answer) => { socket.destroy(); resolve(answer); };
     const timer = setTimeout(() => done(upgraded ? '(no frame back)' : '(no upgrade)'), 5000);
+    socket.on('close', () => { if (closing) { clearTimeout(timer); resolve(closeAnswer); } });
     socket.on('error', (e) => { clearTimeout(timer); done(`(error ${e.code})`); });
     socket.on('connect', () => {
       socket.write([
@@ -130,10 +137,15 @@ function exchange(port, tag, text) {
         }
         upgraded = true;
         buf = buf.slice(end + 4);
-        socket.write(textFrame(text));
+        if (closing === 'client') socket.write(clientFrame(Buffer.from([3, 232]), 8));
+        else if (!closing) socket.write(clientFrame(text));
       }
       const frame = readFrame(buf);
-      if (frame && frame.opcode === 1) {
+      if (closing && frame && frame.opcode === 8) {
+        closeAnswer = String(frame.closeCode);
+        if (closing === 'server') socket.write(clientFrame(Buffer.from([3, 232]), 8));
+        socket.end();
+      } else if (!closing && frame && frame.opcode === 1) {
         clearTimeout(timer);
         done(frame.text);
       }
@@ -171,11 +183,20 @@ async function main() {
     await setRules(c.rules);
     const answers = {};
     for (const [who, port] of [['whistle', W], ['rs', RS]]) {
-      const tag = `${run}-${i}-${who}`;
-      const back = await exchange(port, tag, 'hello');
+      const tag = [run, i, who, ...(c.close ? ['close-' + c.close] : [])].join('-');
+      const back = await exchange(port, tag, 'hello', c.close);
       // The origin's side lands after its echo went out; give it a beat.
       await new Promise((r) => setTimeout(r, 50));
-      answers[who] = { back, origin: (received.get(tag) || []).join(' | ') || '(nothing)' };
+      if (c.close) {
+        const deadline = Date.now() + 2000;
+        while (!closed.has(tag) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+        answers[who] = { back, origin: String(closed.get(tag) ?? '(not closed)') };
+        if (who === 'whistle' && (back !== '1000' || answers[who].origin !== '1000')) {
+          throw new Error('oracle did not complete a normal close: ' + JSON.stringify(answers[who]));
+        }
+      } else {
+        answers[who] = { back, origin: (received.get(tag) || []).join(' | ') || '(nothing)' };
+      }
     }
     ran++;
     const problems = [];

@@ -271,6 +271,8 @@ Requests 的 **Import HAR** 在确认后追加导入。文件与请求体上限 
 
 ### WebSocket 实时控制
 
+正常 Close 握手与主动 Disconnect 不同：转发第一个 Close 后，反向通道最多保留 5 秒，等待对端的 Close 回复；收到回复、EOF／传输失败或主动断开都会结束等待。等待期间拒绝新的手动数据帧，但暂停队列仍可 Release，连接仍可主动 Disconnect。
+
 所有正在拦截的 WebSocket 都能实时切换方向状态，不要求事先写暂停规则。Pause 扣留，Pass 按原顺序放行，Ignore 丢弃该方向的数据帧及此前扣留队列；快速 Ignore → Pass 也不会复活丢弃的帧。状态改变在当前处理中的完整帧之后生效。控制帧仍维持协议运行，Pause 会扣留控制帧；切到 Ignore 时旧队列一起丢弃。
 
 `/api/ws/send` 可加 `type: "binary", encoding: "base64"`，data 是严格 base64；默认仍为 UTF-8 文本。允许空帧。单帧最多 **8 MiB**，超过上限的入站帧会关闭连接；队列使用原有有界背压。手动发帧跳过暂停／忽略并使用正确方向的 mask；不经过 frameScript（既有差异）。UI 支持选择 Binary 和 Load frame file。

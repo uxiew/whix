@@ -57,6 +57,8 @@ const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xa;
 /// Bound allocation before reading a payload, including a paused reader.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// A peer may disappear after the first Close; do not retain it indefinitely.
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 /// `Sec-WebSocket-Accept` for a client's key (RFC 6455 §4.2.2): SHA-1 of the key
 /// and the protocol's fixed GUID, base64.
@@ -353,7 +355,27 @@ pub async fn capturing_tunnel<A, B>(
             session,
         );
         tokio::pin!(up, down);
-        tokio::select! { _ = &mut up => {}, _ = &mut down => {}, _ = closed.wait_for(|v| *v) => {} }
+        let awaiting_reply = tokio::select! {
+            end = &mut up => (end == Sent::Closed).then_some(Dir::Receive),
+            end = &mut down => (end == Sent::Closed).then_some(Dir::Send),
+            _ = closed.wait_for(|v| *v) => None,
+        };
+        if let Some(direction) = awaiting_reply {
+            // Forwarding Close starts the handshake, not the teardown. Keep
+            // the opposite leg alive for its reply, but reject new injections.
+            writers.closing.store(true, Ordering::Release);
+            let reply = async {
+                match direction {
+                    Dir::Send => up.await,
+                    Dir::Receive => down.await,
+                }
+            };
+            tokio::select! {
+                _ = reply => {},
+                _ = closed.wait_for(|v| *v) => {},
+                _ = tokio::time::sleep(CLOSE_GRACE) => {},
+            }
+        }
     }
     writers.abort();
     drop(registration);
@@ -402,6 +424,7 @@ pub struct SessionWriters {
     to_server: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     to_client: Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     closed: tokio::sync::watch::Sender<bool>,
+    closing: AtomicBool,
     pause: Option<Arc<SessionPause>>,
 }
 
@@ -415,6 +438,7 @@ impl SessionWriters {
             to_server: Arc::new(tokio::sync::Mutex::new(Box::new(to_server))),
             to_client: Arc::new(tokio::sync::Mutex::new(Box::new(to_client))),
             closed: tokio::sync::watch::channel(false).0,
+            closing: AtomicBool::new(false),
             pause: None,
         }
     }
@@ -456,6 +480,10 @@ impl SessionWriters {
         self.closed.send_replace(true);
     }
 
+    fn can_send_data(&self) -> bool {
+        self.live() && !self.closing.load(Ordering::Acquire)
+    }
+
     async fn send_payload(&self, dir: &str, opcode: u8, data: &[u8]) -> bool {
         let to_server = match dir {
             "send" => true,
@@ -475,13 +503,14 @@ impl SessionWriters {
             &self.to_client
         };
         let mut closed = self.closed.subscribe();
-        if *closed.borrow() {
+        if !self.can_send_data() {
             return false;
         }
         let result = tokio::select! {
             _ = closed.wait_for(|v| *v) => false,
             result = tokio::time::timeout(Duration::from_secs(5), async {
                 let mut w = half.lock().await;
+                if !self.can_send_data() { return Ok(false); }
                 if self.pause.as_ref().is_some_and(|p| p.of(if to_server {Dir::Send} else {Dir::Receive}).fragmented()) {
                     return Ok(false);
                 }
@@ -838,7 +867,7 @@ struct Leg {
     writers: Arc<SessionWriters>,
 }
 
-async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64)
+async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64) -> Sent
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
@@ -1009,7 +1038,7 @@ impl FrameCtx {
 enum Sent {
     /// Written; the leg carries on.
     Ok,
-    /// Written, and it was the close that ends the conversation.
+    /// Written Close: wait for the other direction to finish its reply.
     Closed,
     /// The peer is gone.
     Failed,
@@ -1036,7 +1065,7 @@ async fn deliver<W: AsyncWrite + Unpin>(
 }
 
 /// The ordinary leg: read a frame, decide about it, write it.
-async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx, inject: Vec<ScriptFrame>)
+async fn pump_direct<R, W>(mut r: R, mut w: W, mut ctx: FrameCtx, inject: Vec<ScriptFrame>) -> Sent
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -1045,14 +1074,15 @@ where
     loop {
         let frame = match read_frame(&mut r).await {
             Ok(Some(f)) => f,
-            _ => break,
+            _ => break Sent::Failed,
         };
         let fin = frame.fin;
         let Some((opcode, payload)) = ctx.process(frame, false).await else {
             continue;
         };
-        if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
-            break;
+        let sent = deliver(&mut w, fin, opcode, &payload, ctx.to_server).await;
+        if sent != Sent::Ok {
+            break sent;
         }
     }
 }
@@ -1075,7 +1105,8 @@ async fn pump_held<R, W>(
     dir: Dir,
     keepalive: bool,
     inject: Vec<ScriptFrame>,
-) where
+) -> Sent
+where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
@@ -1104,7 +1135,7 @@ async fn pump_held<R, W>(
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe.tick().await;
 
-    'leg: loop {
+    let outcome = 'leg: loop {
         let discard = gate.discard_held.swap(false, Ordering::AcqRel);
         if (discard || gate.mode() == DirMode::Ignore) && !held.is_empty() {
             ignore_held_marks(&ctx.state, ctx.session, ctx.direction, held.len());
@@ -1115,11 +1146,11 @@ async fn pump_held<R, W>(
         // The queue empties before anything behind it goes out, wherever the
         // release happened to land — a pause that reordered the conversation it
         // was asked to hold would be worse than no pause at all.
-        if gate.mode() == DirMode::Pass
-            && !held.is_empty()
-            && !flush(&mut w, &mut held, &mut held_bytes, &ctx, gate).await
-        {
-            break;
+        if gate.mode() == DirMode::Pass && !held.is_empty() {
+            let sent = flush(&mut w, &mut held, &mut held_bytes, &ctx, gate).await;
+            if sent != Sent::Ok {
+                break sent;
+            }
         }
         let frame = loop {
             let room =
@@ -1133,14 +1164,14 @@ async fn pump_held<R, W>(
                 // peer is back-pressured. See `MAX_HELD_FRAMES`.
                 frame = rx.recv(), if room => match frame {
                     Some(frame) => break frame,
-                    None => break 'leg,
+                    None => break 'leg Sent::Failed,
                 },
                 // `disable://ping` / `disable://pong` suppress the probe
                 // rather than the tick: the timer is cheap and the flag is
                 // about what goes on the wire.
                 _ = probe.tick(), if keepalive && gate.paused() => {
                     if !send_keepalive(&mut w, ctx.to_server).await {
-                        break 'leg;
+                        break 'leg Sent::Failed;
                     }
                 }
             }
@@ -1161,19 +1192,21 @@ async fn pump_held<R, W>(
             gate.held.store(held.len(), Ordering::Release);
             continue;
         }
-        if deliver(&mut w, fin, opcode, &payload, ctx.to_server).await != Sent::Ok {
-            break;
+        let sent = deliver(&mut w, fin, opcode, &payload, ctx.to_server).await;
+        if sent != Sent::Ok {
+            break sent;
         }
         gate.end_frame(fin, opcode);
-    }
+    };
     // This leg is over however it ended, and the reader may still be parked on a
     // peer that is never going to speak again. Nothing is left to read what it
     // would produce, so let it go and let it drop its half of the socket with it.
     drop(reader);
+    outcome
 }
 
-/// Let a released direction's queue go, oldest first. `false` when the leg is
-/// over — the peer went away, or the queue held the close that ends it.
+/// Let a released direction's queue go, oldest first. Keep Close distinct from
+/// EOF/write failure so a held Close still gets its closing-handshake reply.
 ///
 /// The captures are unmarked here rather than by the endpoint that lifted the
 /// pause because this task is the only writer of that mark, so there is no
@@ -1185,9 +1218,9 @@ async fn flush<W: AsyncWrite + Unpin>(
     held_bytes: &mut usize,
     ctx: &FrameCtx,
     gate: &DirPause,
-) -> bool {
+) -> Sent {
     let mut sent = 0usize;
-    let mut alive = true;
+    let mut outcome = Sent::Ok;
     while gate.mode() == DirMode::Pass
         && !gate.discard_held.load(Ordering::Acquire)
         && !held.is_empty()
@@ -1201,18 +1234,18 @@ async fn flush<W: AsyncWrite + Unpin>(
             }
             Sent::Closed => {
                 sent += 1;
-                alive = false;
+                outcome = Sent::Closed;
                 break;
             }
             Sent::Failed => {
-                alive = false;
+                outcome = Sent::Failed;
                 break;
             }
         }
     }
     gate.held.store(held.len(), Ordering::Release);
     clear_held_marks(&ctx.state, ctx.session, ctx.direction, sent);
-    alive
+    outcome
 }
 
 fn ignore_held_marks(state: &AppState, session: u64, direction: &str, count: usize) {

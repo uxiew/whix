@@ -216,3 +216,139 @@ fn rapid_ignore_then_pass_cannot_resurrect_a_held_frame() {
         finish(wire).await;
     });
 }
+
+#[test]
+fn normal_close_waits_for_the_reply_in_both_directions_including_a_held_close() {
+    rt().block_on(async {
+        for dir in [Dir::Send, Dir::Receive] {
+            for paused in [false, true] {
+                let state = state_with(Plugins::new());
+                let mut wire = spawn_tunnel(&state, FramePlan::default(), None);
+                let pause = gate_of(&state).await;
+                if paused {
+                    pause.of(dir).set_mode(DirMode::Pause).unwrap();
+                }
+                let (sender, receiver) = if dir == Dir::Send {
+                    (&mut wire.client, &mut wire.server)
+                } else {
+                    (&mut wire.server, &mut wire.client)
+                };
+                write_frame(sender, true, OPCODE_CLOSE, &[3, 232], dir == Dir::Send)
+                    .await
+                    .unwrap();
+                if paused {
+                    until("close held", || pause.of(dir).held() == 1).await;
+                    pause.of(dir).set_mode(DirMode::Pass).unwrap();
+                }
+                assert_eq!(
+                    read_frame(receiver).await.unwrap().unwrap().opcode,
+                    OPCODE_CLOSE
+                );
+                assert!(
+                    !wire.tunnel.is_finished(),
+                    "a Close frame is not a completed handshake"
+                );
+                let reply_dir = if dir == Dir::Send {
+                    Dir::Receive
+                } else {
+                    Dir::Send
+                };
+                if paused {
+                    pause.of(reply_dir).set_mode(DirMode::Pause).unwrap();
+                }
+                write_frame(receiver, true, OPCODE_CLOSE, &[3, 232], dir == Dir::Receive)
+                    .await
+                    .unwrap();
+                if paused {
+                    until("reply held", || pause.of(reply_dir).held() == 1).await;
+                    pause.of(reply_dir).set_mode(DirMode::Pass).unwrap();
+                }
+                let reply = tokio::time::timeout(Duration::from_secs(1), read_frame(sender))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expect("close reply");
+                assert_eq!(reply.opcode, OPCODE_CLOSE);
+                assert_eq!(reply.payload, [3, 232]);
+                tokio::time::timeout(Duration::from_secs(1), &mut wire.tunnel)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(state.ws_write.lock().unwrap().is_empty());
+                assert!(state.ws_pause.lock().unwrap().is_empty());
+            }
+        }
+    });
+}
+
+#[test]
+fn closing_rejects_new_injections_but_abort_and_eof_still_cancel_immediately() {
+    rt().block_on(async {
+        for abort in [false, true] {
+            let state = state_with(Plugins::new());
+            let mut wire = spawn_tunnel(&state, FramePlan::default(), None);
+            gate_of(&state).await;
+            let writers = state.ws_write.lock().unwrap()[&7].clone();
+            write_frame(&mut wire.client, true, OPCODE_CLOSE, &[3, 232], true)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_frame(&mut wire.server).await.unwrap().unwrap().opcode,
+                OPCODE_CLOSE
+            );
+            until("closing", || writers.closing.load(Ordering::Acquire)).await;
+            assert!(
+                writers.live(),
+                "Release and Disconnect remain available while closing"
+            );
+            assert!(!writers.send("receive", b"after Close").await);
+            assert!(!wire.tunnel.is_finished());
+            if abort {
+                writers.abort();
+            } else {
+                wire.server.shutdown().await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), &mut wire.tunnel)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(state.ws_write.lock().unwrap().is_empty());
+            assert!(state.ws_pause.lock().unwrap().is_empty());
+        }
+    });
+}
+
+#[test]
+fn an_unanswered_close_has_a_bounded_grace_period() {
+    rt().block_on(async {
+        let state = state_with(Plugins::new());
+        let mut wire = spawn_tunnel(&state, FramePlan::default(), None);
+        gate_of(&state).await;
+        write_frame(&mut wire.client, true, OPCODE_CLOSE, &[3, 232], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut wire.server).await.unwrap().unwrap().opcode,
+            OPCODE_CLOSE
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut wire.tunnel)
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(CLOSE_GRACE + Duration::from_secs(1), &mut wire.tunnel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.ws_write.lock().unwrap().is_empty());
+        assert!(state.ws_pause.lock().unwrap().is_empty());
+        assert_eq!(
+            wire.client.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            wire.server.read_u8().await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    });
+}
