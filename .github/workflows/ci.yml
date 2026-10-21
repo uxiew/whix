@@ -290,10 +290,14 @@ jobs:
       - run: npm ci --prefix tests/differential
       - run: cargo build --locked
       - run: node tests/differential/run.js fast --out target/differential/fast
+      - name: Traffic stress smoke — concurrency and slow-peer isolation
+        run: node tests/differential/traffic-stress.js --seconds 5 --connections 4 --frames 8 --bytes 256
       # The versions, binary hash, corpus hashes and every step's output, pass or fail.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: differential-fast
-          path: target/differential/fast/
+          path: |
+            target/differential/fast/
+            target/traffic-stress/*.json
           retention-days: 30

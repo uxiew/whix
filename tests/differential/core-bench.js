@@ -52,6 +52,7 @@ const STATE = process.env.DIFF_STATE || fs.mkdtempSync(path.join(os.tmpdir(), 'w
 const ONLY = process.env.CASES ? new Set(process.env.CASES.split(',')) : null;
 const JSON_OUT = (() => { const i = process.argv.indexOf('--json'); return i > 0 ? process.argv[i + 1] : null; })();
 const O = `127.0.0.1:${ORIGIN}`;
+let currentCase = 'startup';
 
 // ── fixtures ────────────────────────────────────────────────────────────
 
@@ -190,15 +191,27 @@ function start(which, port, extra = []) {
           const whistle = require(${JSON.stringify(WHISTLE.dir)});
           whistle({ port: ${port}, baseDir: ${JSON.stringify(dir)}, host: '127.0.0.1' }, () => console.log('READY'));
         `], { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] })
-      : spawn(RS_BIN, ['--port', String(port), '--no-persist', '--dir', dir, '--insecure-upstream', ...extra],
+      : spawn(RS_BIN, ['--port', String(port), '--no-persist', '--dir', dir, '--insecure-upstream',
+          ...(JSON_OUT ? ['--verbose'] : []), ...extra],
         { stdio: ['ignore', 'pipe', 'pipe'] });
     let done = false;
     let log = '';
+    let traceEnabled = !!JSON_OUT;
     const t = setTimeout(() => {
       if (!done) { done = true; child.kill('SIGKILL'); reject(new Error(`${which} did not start:\n${log}`)); }
     }, 30000);
     const watch = (d) => {
       log += d;
+      // Keep runtime diagnostics beside the verdict: a successful handshake
+      // cannot explain a missing script, and killed children lose their logs.
+      if (traceEnabled) {
+        try {
+          fs.appendFileSync(path.join(path.dirname(JSON_OUT), `core-${which}-${port}.log`), `[${currentCase}] ${d}`);
+        } catch (error) {
+          traceEnabled = false;
+          console.error('Could not save proxy trace: ' + error.message);
+        }
+      }
       if (!done && /READY|listening on/.test(String(d))) { done = true; clearTimeout(t); resolve(child); }
     };
     child.stdout.on('data', watch);
@@ -661,6 +674,7 @@ async function main() {
     children.push(await start('whistle', W), await start('rs', RS));
     for (const c of cases(certs)) {
       if (ONLY && !ONLY.has(c.group)) continue;
+      currentCase = `${c.group}: ${c.name}`;
       const answers = {};
       for (const [which, port] of [['whistle', W], ['rs', RS]]) {
         // A script case names the proxy's own port, so its rules differ by side.
@@ -678,6 +692,7 @@ async function main() {
       raw.push({ case: `${c.group}: ${c.name}`, whistle: answers.whistle, rs: answers.rs, same });
       if (!same) report.push({ name: `${c.group}: ${c.name}`, problems: [`answer: whistle=${answers.whistle} rs=${answers.rs}`] });
     }
+    currentCase = 'plugin scenarios';
     if (!ONLY || ONLY.has('plugin')) oneSidedResults = await oneSided();
   } finally {
     for (const c of children) c.kill('SIGKILL');

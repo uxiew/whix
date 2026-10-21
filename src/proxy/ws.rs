@@ -362,8 +362,7 @@ pub async fn capturing_tunnel<A, B>(
         };
         if let Some(direction) = awaiting_reply {
             // Forwarding Close starts the handshake, not the teardown. Keep
-            // the opposite leg alive for its reply, but reject new injections.
-            writers.closing.store(true, Ordering::Release);
+            // the opposite leg alive for its reply.
             let reply = async {
                 match direction {
                     Dir::Send => up.await,
@@ -912,7 +911,7 @@ async fn write_injections<W: AsyncWrite + Unpin>(
 ) {
     for frame in inject {
         let opcode = opcode_of(frame);
-        if deliver(w, true, opcode, &frame.data, ctx.to_server).await != Sent::Ok {
+        if deliver(w, true, opcode, &frame.data, ctx).await != Sent::Ok {
             return;
         }
         ctx.state.record_frame(WsFrame::new(
@@ -1050,9 +1049,14 @@ async fn deliver<W: AsyncWrite + Unpin>(
     fin: bool,
     opcode: u8,
     payload: &[u8],
-    to_server: bool,
+    ctx: &FrameCtx,
 ) -> Sent {
-    if write_frame(w, fin, opcode, payload, to_server)
+    // A buffered writer can expose Close before its flush finishes. Seal new
+    // injections before awaiting the write, not after the pump returns.
+    if opcode == OPCODE_CLOSE {
+        ctx.writers.closing.store(true, Ordering::Release);
+    }
+    if write_frame(w, fin, opcode, payload, ctx.to_server)
         .await
         .is_err()
     {
@@ -1080,7 +1084,7 @@ where
         let Some((opcode, payload)) = ctx.process(frame, false).await else {
             continue;
         };
-        let sent = deliver(&mut w, fin, opcode, &payload, ctx.to_server).await;
+        let sent = deliver(&mut w, fin, opcode, &payload, &ctx).await;
         if sent != Sent::Ok {
             break sent;
         }
@@ -1192,7 +1196,7 @@ where
             gate.held.store(held.len(), Ordering::Release);
             continue;
         }
-        let sent = deliver(&mut w, fin, opcode, &payload, ctx.to_server).await;
+        let sent = deliver(&mut w, fin, opcode, &payload, &ctx).await;
         if sent != Sent::Ok {
             break sent;
         }
@@ -1227,7 +1231,7 @@ async fn flush<W: AsyncWrite + Unpin>(
     {
         let (fin, opcode, payload) = held.remove(0);
         *held_bytes = held_bytes.saturating_sub(payload.len());
-        match deliver(w, fin, opcode, &payload, ctx.to_server).await {
+        match deliver(w, fin, opcode, &payload, ctx).await {
             Sent::Ok => {
                 sent += 1;
                 gate.end_frame(fin, opcode);
@@ -1512,6 +1516,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod concurrency_cases;
     mod control_cases;
     use super::*;
     use crate::ca::CertAuthority;
