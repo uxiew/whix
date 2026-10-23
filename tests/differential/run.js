@@ -105,6 +105,7 @@ const EXTRA = range(10, 17);
 
 const MINUTE = 60 * 1000;
 const FAST = [
+  { name: 'clock-expiry', args: ['clock-expiry.test.js'], timeout: MINUTE },
   { name: 'oracle-docs', args: ['rules-oracle.js', '--values', '--quiet'], timeout: 5 * MINUTE },
   { name: 'oracle-cases', args: ['rules-oracle.js', '--from-cases', '--values', '--quiet'], ports: EXTRA, timeout: 5 * MINUTE },
   { name: 'qr', args: ['qr-bench.js'], timeout: 5 * MINUTE },

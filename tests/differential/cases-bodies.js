@@ -174,7 +174,7 @@ module.exports = [
   // the declared cost of buffering where whistle streams — see `src/config.rs`.
   { name: 'resReplace just under the rewrite ceiling', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/big?n=16777100' } },
   { name: 'resReplace just over the rewrite ceiling', rules: `${P} resReplace://ORIGINAL=REWRITTEN`, request: { path: '/big?n=16777300' } },
-  { name: 'resAppend just over the rewrite ceiling', rules: `${P} resAppend://(TAIL)`, request: { path: '/big?n=16777300' } },
+  { name: 'resAppend just over the rewrite ceiling', clockExpires: { offsetMs: -60000000, gapMs: 2300 }, rules: `${P} resAppend://(TAIL)`, request: { path: '/big?n=16777300' } },
 
   // ── the injection family's remaining spellings ──────────────────────────
   //

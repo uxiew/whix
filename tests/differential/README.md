@@ -18,7 +18,7 @@
 cargo build --locked            # 在仓库根目录跑；二进制比 src/ 旧，run.js 会拒绝
 cd tests/differential
 npm ci                          # 只需一次——按锁文件装真 whistle
-node run.js fast                # 约 5 秒：规则对照组跑两份语料，外加二维码编码器
+node run.js fast                # 规则对照、二维码、迁移导出和日期夹具检查
 node run.js network             # 约 21 分钟（2026-10-01 实测 `all` 用了 1240 秒）：两边代理都起来，所有语料和测试台，以及上游自带的测试
 node run.js network --only cases-delete,https   # 只跑几步；--list 列出所有步骤名
 ```
@@ -523,3 +523,25 @@ cargo test --locked --test script_startup concurrent_script_startup_keeps_result
 它直接调用真实执行入口、分别断言规则／状态／正文／PAC 结果，不代表 HTTP 吞吐量或所有
 机器的并发容量；默认忽略是为了不把 CPU 争抢带进普通测试，手工运行的退出码仍须为 0。
 `cases-compose` 另含两条真实 Whistle 对照，检查首次访问 Buffer 原型时请求／响应头的值。
+
+## 已知动态 Expires 的时钟检查
+
+在仓库根目录运行 `node --test tests/differential/clock-expiry.test.js`。它也作为
+`run.js fast` 的 `clock-expiry` 阶段运行；快速套件现在有 5 个阶段。
+
+当前仅 `resAppend just over the rewrite ceiling` 显式标记
+`clockExpires: { offsetMs: -60000000, gapMs: 2300 }`：这是已知的禁用缓存策略，且每次
+对两个本机代理的请求之间固定留 2300 ms，持续覆盖原来的跨秒误报。不是根据两个日期接近程度
+推断策略，也不使用可被规则改写的响应 Date 作为时钟。其他用例、Set-Cookie 和其他响应
+字段的比较规则不变；不要给固定日期或未知策略的用例加这个标记。
+
+夹具分别记录发出请求和收到响应头时的墙钟时间，用单调时钟交叉核对，随后独立检查每端
+是否恰有一个规范 GMT 格式的 Expires、且落在“该次收头时间窗 + 已知偏移”的秒级舍入范围内。
+正文下载时间不进入这个窗口。单次窗口超过 1000 ms，或墙钟／单调计时差超过 20 ms，均
+报告证据不足而失败，不扩大范围。`offsetMs` 必须是安全整数，`gapMs` 可省略，或为
+0…3000 的整数；非法配置在启动源站前拒绝。
+
+双方日期即使相同，只要不满足各自预期仍会失败；缺失／重复／畸形日期、超出预期范围的偏移以及
+其他字段的差异也不能因此放过。独立校验错误在差异豁免判定之后加入最终失败列表，无法
+被既有声明消掉。结果中的 `raw` 保留原始日期差异，`clockChecks` 保存期望窗口和实测
+证据。旧的一秒日期判定没有扩容；本机制只适用于显式标记的用例。

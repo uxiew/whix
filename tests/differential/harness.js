@@ -13,6 +13,7 @@
 const http = require('http');
 const path = require('path');
 const zlib = require('zlib');
+const { validatePolicy, startClock, atHeaders, assessExpiry, withClockFailures } = require('./clock-expiry');
 const { judge, fieldOf } = require('./declared.js');
 const { forVersion, MEASURED } = require('./whistle-pkg');
 
@@ -732,6 +733,7 @@ function decodeBody(headers, buf) {
 function through(port, { method = 'GET', path = '/echo', url, headers = {}, body = '' }) {
   const target = url || `http://127.0.0.1:${ORIGIN}${path}`;
   const authority = target.slice(target.indexOf('://') + 3).split('/')[0];
+  const started = startClock();
   return new Promise((resolve) => {
     // A response whose head arrived and whose body never ends leaves `end`
     // unfired, and one such case used to stall the whole run with nothing
@@ -748,11 +750,14 @@ function through(port, { method = 'GET', path = '/echo', url, headers = {}, body
       path: target,
       headers: { host: authority, ...headers },
     }, (r) => {
+      const clock = atHeaders(started);
       const chunks = [];
       r.on('data', (c) => chunks.push(c));
       r.on('end', () => res({
         status: r.statusCode,
         headers: norm(r.headers),
+        clock,
+        expiresHeaderCount: r.rawHeaders.filter((v, i) => i % 2 === 0 && v.toLowerCase() === 'expires').length,
         body: decodeBody(r.headers, Buffer.concat(chunks)),
         // Trailers arrive after the body, so they are only readable here.
         trailers: norm(r.trailers),
@@ -869,10 +874,12 @@ async function collectUnruled(cases) {
 }
 
 async function main() {
-  const origin = await startOrigin();
   const CASES = require(CASES_FILE);
+  for (const c of CASES) if (c.clockExpires !== undefined) validatePolicy(c.clockExpires);
+  const origin = await startOrigin();
   let ran = 0, differing = 0;
   const report = [];
+  const clockChecks = [], clockFailures = [];
   const inert = [];
   /** How many differences each `EXPECTED` entry excused, by id. */
   const expected = {};
@@ -903,7 +910,9 @@ async function main() {
     process.stderr.write(`… ${c.name}\n`);
     await setRules(c);
     const req = c.request || {};
-    const [w, rs] = [await through(W, req), await through(RS, req)];
+    const w = await through(W, req);
+    if (c.clockExpires?.gapMs) await new Promise((resolve) => setTimeout(resolve, c.clockExpires.gapMs));
+    const rs = await through(RS, req);
     ran++;
 
     const problems = problemsBetween(w, rs);
@@ -916,8 +925,13 @@ async function main() {
     const bare = unruled.get(JSON.stringify(c.request || {}));
     if (bare && problemsBetween(bare, rs).length === 0) inert.push(c.name);
 
+    const assessed = assessExpiry(c.clockExpires, w, rs, problems);
+    if (assessed.evidence) clockChecks.push({ name: c.name, ...assessed.evidence });
+    const clockErrors = assessed.problems.filter((p) => p.startsWith('res.clock.expires:'));
+    if (clockErrors.length) clockFailures.push({ name: c.name, problems: clockErrors });
     const left = [];
-    for (const p of problems) {
+    for (const p of assessed.problems) {
+      if (p.startsWith('res.clock.expires:')) continue; // Never pass independent assertions to waivers.
       const e = expectedFor(p, c);
       if (e) expected[e.id] = (expected[e.id] || 0) + 1;
       else left.push(p);
@@ -929,13 +943,15 @@ async function main() {
   // What `EXPECTED` left is either declared for this case in `declared.js` or
   // news. `differing` counts the news — the cases nothing explains.
   const verdict = judge(path.basename(CASES_FILE), report, CASES.map((c) => c.name));
-  differing = verdict.news.length;
+  const news = withClockFailures(verdict.news, clockFailures);
+  differing = news.length;
   console.log(JSON.stringify({
     ran,
     differing,
     declared: verdict.declared,
     stale: verdict.stale,
-    report: verdict.news,
+    report: news,
+    clockChecks,
     expected,
     inert: inert.length,
     inertCases: inert,
@@ -947,4 +963,6 @@ async function main() {
   process.exitCode = differing || verdict.stale.length ? 1 : 0;
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// Importing the observation function for tests must not start proxy fixtures.
+module.exports = { through };
+if (require.main === module) main().catch((e) => { console.error(e); process.exit(1); });
