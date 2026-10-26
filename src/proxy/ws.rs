@@ -4,7 +4,7 @@
 //! frame can be captured for the Network view (whistle surfaces every frame).
 //! Two hooks may also sit in that path, and they run in this order:
 //!
-//! 1. **`frameScript`** — the rule operator, on whole text and binary frames.
+//! 1. **`frameScript`** — the rule operator, on whole text and binary messages.
 //!    It is a rule, and rules run before plugins everywhere else in this proxy.
 //!    One script per connection, evaluated once: see
 //!    [`crate::proxy::script::FrameScript`].
@@ -28,6 +28,9 @@
 //! [`SessionPause`]. That is the one place where a control frame is *not*
 //! exempt, because upstream pauses the byte stream rather than the frames in it.
 
+mod message;
+
+use message::Messages;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -961,10 +964,9 @@ impl FrameCtx {
         // upstream's `cb(null, chunk || null)` does with a falsy return
         // (`_original/lib/socket-mgr.js:198-206`).
         //
-        // A *fragment* is not offered. Upstream reassembles a fragmented
-        // message before its handler sees it; this port relays frame by frame,
-        // and a handler that rewrote one fragment of a message would be
-        // rewriting something its author never saw whole.
+        // The pump reassembles fragments only when this direction has a
+        // handler. Plugins then see the complete, possibly rewritten message;
+        // unhandled directions retain their original frame boundaries.
         if let Some(script) = &self.script
             && frame.fin
             && matches!(opcode, OPCODE_TEXT | OPCODE_BINARY)
@@ -1032,6 +1034,16 @@ impl FrameCtx {
     }
 }
 
+impl FrameCtx {
+    fn messages(&self) -> Messages {
+        Messages::new(
+            self.script
+                .as_ref()
+                .is_some_and(|s| s.handles(self.to_server)),
+        )
+    }
+}
+
 /// What became of one frame on its way to the peer.
 #[derive(PartialEq, Eq)]
 enum Sent {
@@ -1075,10 +1087,16 @@ where
     W: AsyncWrite + Unpin,
 {
     write_injections(&mut w, &ctx, &inject).await;
+    let mut messages = ctx.messages();
     loop {
         let frame = match read_frame(&mut r).await {
             Ok(Some(f)) => f,
             _ => break Sent::Failed,
+        };
+        let frame = match messages.push(frame) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(_) => break Sent::Failed,
         };
         let fin = frame.fin;
         let Some((opcode, payload)) = ctx.process(frame, false).await else {
@@ -1118,6 +1136,7 @@ where
     // peer's traffic, and holding them would hold something nobody sent.
     write_injections(&mut w, &ctx, &inject).await;
     let gate = pause.of(dir);
+    let mut messages = ctx.messages();
     let (tx, mut rx) = mpsc::channel::<Frame>(1);
     let reader = ReaderTask(tokio::spawn(async move {
         let mut r = r;
@@ -1180,9 +1199,20 @@ where
                 }
             }
         };
-        let fin = frame.fin;
+        let original_fin = frame.fin;
         let original_opcode = frame.opcode;
         ctx.mode = gate.begin_frame(&frame);
+        let frame = match messages.push(frame) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(_) => break Sent::Failed,
+        };
+        if messages.enabled() {
+            // No fragments have gone on the wire. The complete message is now
+            // safe to drop/hold, or precede with the handler's own injections.
+            gate.end_frame(original_fin, original_opcode);
+        }
+        let fin = frame.fin;
         let holding = ctx.mode == DirMode::Pause;
         let Some((opcode, payload)) = ctx.process(frame, holding).await else {
             if !holding {
@@ -1518,6 +1548,7 @@ where
 mod tests {
     mod concurrency_cases;
     mod control_cases;
+    mod fragment_cases;
     mod script_startup_cases;
     use super::*;
     use crate::ca::CertAuthority;

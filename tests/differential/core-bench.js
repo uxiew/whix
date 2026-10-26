@@ -100,7 +100,22 @@ function startOrigin() {
         const binary = !!(flags && flags.binary);
         const text = Buffer.isBuffer(msg) ? msg.toString('latin1') : String(msg);
         wsReceived.set(tag, [...(wsReceived.get(tag) || []), (binary ? 'bin:' : 'txt:') + text]);
-        ws.send(msg, { binary });
+        if (tag.startsWith('split-reply-')) {
+          const bytes = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+          // ws 1.x send() forces fin=true; its public stream API preserves it.
+          let first = true;
+          ws.stream({ binary }, (error, send) => {
+            if (error) return;
+            if (first) { first = false; send(bytes.subarray(0, 1), false); }
+            else send(bytes.subarray(1), true);
+          });
+        } else if (tag.startsWith('inject2-')) {
+          // Keep the round trip longer than the old 120 ms input timer: this
+          // exchange must wait for its echo, not compare scheduler-dependent order.
+          setTimeout(() => ws.send(msg, { binary }), 400);
+        } else {
+          ws.send(msg, { binary });
+        }
       });
     });
     server.on('error', reject);
@@ -275,7 +290,7 @@ async function originHeader(port, url, name, opts) {
 /**
  * A WebSocket through a proxy, spoken by hand: the client library here cannot
  * be pointed at a proxy, and a bench that reaches the origin directly measures
- * nothing. Text and binary frames, masked, unfragmented — all a case needs.
+ * nothing. Small masked frames, including explicit continuation/control frames.
  */
 function wsVia(port, tag, frames) {
   return new Promise((resolve) => {
@@ -284,6 +299,8 @@ function wsVia(port, tag, frames) {
     const out = { client: [], origin: [], handshake: 0 };
     let buf = Buffer.alloc(0);
     let upgraded = false;
+    let message = null;
+    let waiting = [];
     let finished = false;
     const finish = () => {
       if (finished) return;
@@ -296,7 +313,7 @@ function wsVia(port, tag, frames) {
     const frame = (f) => {
       const payload = Buffer.from(f.data, 'latin1');
       const mask = crypto.randomBytes(4);
-      const head = Buffer.from([0x80 | (f.binary ? 2 : 1), 0x80 | payload.length]);
+      const head = Buffer.from([(f.fin === false ? 0 : 0x80) | (f.opcode ?? (f.binary ? 2 : 1)), 0x80 | payload.length]);
       const masked = Buffer.from(payload.map((b, i) => b ^ mask[i % 4]));
       return Buffer.concat([head, mask, masked]);
     };
@@ -313,17 +330,30 @@ function wsVia(port, tag, frames) {
         buf = buf.slice(end + 4);
         upgraded = true;
         if (out.handshake !== 101) { clearTimeout(timer); return finish(); }
-        // One at a time, so the order the origin sees is the order sent.
-        frames.forEach((f, i) => setTimeout(() => sock.write(frame(f)), 120 * (i + 1)));
+        // Pace independent inputs; causal conversations wait for the actual
+        // reply instead of assuming a round trip fits inside 120 ms.
+        frames.forEach((f, i) => {
+          if (f.after) waiting.push(f);
+          else setTimeout(() => sock.write(frame(f)), 120 * (i + 1));
+        });
       }
       while (buf.length >= 2) {
         const len = buf[1] & 0x7f;
         if (len > 125 || buf.length < 2 + len) break;
+        const fin = !!(buf[0] & 0x80);
         const opcode = buf[0] & 0x0f;
         const data = buf.slice(2, 2 + len).toString('latin1');
         buf = buf.slice(2 + len);
-        if (opcode === 1 || opcode === 2) out.client.push((opcode === 2 ? 'bin:' : 'txt:') + data);
+        if (opcode === 1 || opcode === 2) message = { opcode, data };
+        else if (opcode === 0 && message) message.data += data;
+        if (fin && (opcode === 0 || opcode === 1 || opcode === 2) && message) {
+          out.client.push((message.opcode === 2 ? 'bin:' : 'txt:') + message.data);
+          message = null;
+        }
       }
+      const ready = waiting.filter((f) => f.after.some((reply) => out.client.includes(reply)));
+      waiting = waiting.filter((f) => !ready.includes(f));
+      for (const f of ready) sock.write(frame(f));
       // Not "one reply per frame sent": a script may inject frames of its own,
       // so the exchange is over when the timer says so.
     });
@@ -365,7 +395,7 @@ const ROUTE = `probe.test host://${O}\n`;
  */
 function cases(certs) {
   const list = [];
-  const add = (group, name, rules, ask) => list.push({ group, name, rules, ask });
+  const add = (group, name, rules, ask, expect, legacyExpect) => list.push({ group, name, rules, ask, expect, legacyExpect });
 
   // ── JavaScript regular expressions ──
   // Each pair is a pattern that must match and a twin that must not, so "the
@@ -471,6 +501,7 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
 
   // ── frameScript ──
   const FRAME = (body) => block('f.js', body) + `${O} frameScript://{f.js}`;
+  const exchange = (origin, client = origin) => ({ handshake: 101, origin, client });
   const ws = (tag, frames) => async (port) => {
     const x = await wsVia(port, `${tag}-${port}-${++wsSequence}`, frames);
     return { handshake: x.handshake, origin: x.origin, client: x.client };
@@ -516,7 +547,9 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
     ws('topwrap', [{ data: 'a' }]));
   add('frame', 'sendToClient from a handler, through the other handler',
     FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf) { c.sendToClient('ack:' + buf); return buf; };\nc.handleSendToClientFrame = function (buf, opts) { return 'C(' + buf + ')' + (opts && opts.frameScript ? '!' : ''); };`),
-    ws('inject2', [{ data: 'a' }, { data: 'b' }]));
+    ws('inject2', [{ data: 'a' }, { data: 'b', after: ['txt:C(a)', 'txt:C(C(a))'] }]),
+    exchange(['txt:a', 'txt:b'], ['txt:C(ack:a)!', 'txt:C(a)', 'txt:C(ack:b)!', 'txt:C(b)']),
+    exchange(['txt:C(a)', 'txt:C(b)'], ['txt:C(C(a))', 'txt:C(C(b))']));
   add('frame', 'sendToServer from the handler for that direction',
     FRAME(`var c = ctx;\nc.handleSendToServerFrame = function (buf, opts) { if (!opts.frameScript && String(buf) === 'a') { c.sendToServer('extra'); } return buf; };`),
     ws('inject3', [{ data: 'a' }, { data: 'b' }]));
@@ -557,6 +590,47 @@ rules.push('* file://{out.json}');`) + ROUTE + 'probe.test reqScript://{s.js}';
   add('frame', 'a script that throws while it runs',
     FRAME(`ctx.handleSendToServerFrame = function (buf) { return 'X' + buf; };\nthrow new Error('early');`),
     ws('throwtop', [{ data: 'a' }]));
+
+  // Fragmented messages must reach a handler once, not bypass it or run once
+  // per fragment. Kept apart for targeted red/green runs with CASES=frame-fragment.
+  const fragments = [
+    { data: 'a', fin: false }, { data: 'b', opcode: 0, fin: false },
+    { data: 'c', opcode: 0 }, { data: 'd' },
+  ];
+  add('frame-fragment', 'one invocation per message with interleaved ping',
+    FRAME(`var n = 0;
+ctx.handleSendToServerFrame = function (buf) { return 'N' + (++n) + ':' + buf; };`),
+    ws('fragment-state', [fragments[0], { data: 'p', opcode: 9 }, ...fragments.slice(1)]),
+    exchange(['txt:N1:abc', 'txt:N2:d']), exchange(['txt:abc', 'txt:d']));
+  add('frame-fragment', 'binary fragments preserve bytes and explicit binary output',
+    FRAME(`var B = Buffer;
+ctx.handleSendToServerFrame = function (buf, opts) { opts.binary = true; return B.concat([B.from([1]), buf]); };`),
+    ws('fragment-binary', [{ data: '\x00\xff', binary: true, fin: false }, { data: '\x80', opcode: 0 }]),
+    exchange(['bin:\x01\x00\xff\x80']),
+    exchange(['txt:\x00\ufffd\ufffd'], ['txt:\x00\xef\xbf\xbd\xef\xbf\xbd']));
+  add('frame-fragment', 'UTF-8 codepoint split across fragments',
+    FRAME(`ctx.handleSendToServerFrame = function (buf) { return buf.length + ':' + buf.toString('hex'); };`),
+    ws('fragment-utf8', [{ data: '\xe4', fin: false }, { data: '\xb8\xad', opcode: 0 }]),
+    exchange(['txt:3:e4b8ad']), exchange(['txt:中'], ['txt:\xe4\xb8\xad']));
+  add('frame-fragment', 'drop the complete message without losing the next one',
+    FRAME(`ctx.handleSendToServerFrame = function (buf) { return String(buf) === 'abc' ? null : buf; };`),
+    ws('fragment-drop', fragments), exchange(['txt:d']), exchange(['txt:abc', 'txt:d']));
+  add('frame-fragment', 'handler injections go before the reassembled message',
+    FRAME(`var c = ctx;
+c.handleSendToServerFrame = function (buf, opts) { if (!opts.frameScript) { c.sendToServer('extra'); c.sendToClient('ack:' + buf); } return buf; };`),
+    ws('fragment-inject', fragments.slice(0, 3)),
+    exchange(['txt:extra', 'txt:abc'], ['txt:ack:abc', 'txt:extra', 'txt:abc']), exchange(['txt:abc']));
+  add('frame-fragment', 'client-bound fragments reach the client-bound handler',
+    FRAME(`ctx.handleSendToClientFrame = function (buf) { return 'C:' + buf; };`),
+    ws('split-reply-text', [{ data: 'abc' }]), exchange(['txt:abc'], ['txt:C:abc']));
+  add('frame-fragment', 'a direction with no handler still forwards its fragments',
+    FRAME(`ctx.handleSendToClientFrame = function (buf) { return 'C:' + buf; };`),
+    ws('fragment-unhandled', fragments.slice(0, 3)), exchange(['txt:abc'], ['txt:C:abc']));
+  add('frame-fragment', 'empty fragments still form one message',
+    FRAME(`var n = 0;
+ctx.handleSendToServerFrame = function (buf) { return 'N' + (++n) + ':' + buf.length; };`),
+    ws('fragment-empty', [{ data: '', fin: false }, { data: '', opcode: 0 }, { data: 'd' }]),
+    exchange(['txt:N1:0', 'txt:N2:1']), exchange(['txt:', 'txt:d']));
 
   // ── frameScript over a plain TCP tunnel ──
   const T = `127.0.0.1:${TCP}`;
@@ -693,6 +767,8 @@ async function main() {
   const children = [];
   const report = [];
   const raw = [];
+  const expectationFailures = [];
+  let expectationChecks = 0;
   let oneSidedResults = [];
   try {
     children.push(await start('whistle', W), await start('rs', RS));
@@ -710,7 +786,18 @@ async function main() {
         } else if (which === 'whistle') {
           await setRules(c.rules);
         }
-        answers[which] = JSON.stringify(await c.ask(port));
+        const observed = await c.ask(port);
+        answers[which] = JSON.stringify(observed);
+        // Fixed expected content, not just equality: two proxies bypassing the
+        // handler must fail too. Pin 2.10.8's measured legacy answers separately
+        // so a declaration cannot hide arbitrary changes on that side either.
+        if (c.expect) {
+          const expected = which === 'whistle' && WHISTLE.version === '2.10.8'
+            ? (c.legacyExpect || c.expect) : c.expect;
+          expectationChecks++;
+          try { assert.deepEqual(observed, expected); }
+          catch { expectationFailures.push({ case: currentCase, proxy: which, expected, observed }); }
+        }
       }
       const same = answers.whistle === answers.rs;
       raw.push({ case: `${c.group}: ${c.name}`, whistle: answers.whistle, rs: answers.rs, same });
@@ -728,15 +815,16 @@ async function main() {
   const stale = ONLY ? [] : verdict.stale;
   const out = {
     ran: raw.length, differing: verdict.news.length, declared: verdict.declared, stale,
-    report: verdict.news, raw, oneSided: oneSidedResults,
+    report: verdict.news, raw, oneSided: oneSidedResults, expectationChecks, expectationFailures,
   };
   if (JSON_OUT) fs.writeFileSync(JSON_OUT, JSON.stringify(out, null, 2));
   const mark = (r) => (r.same ? 'same' : news.has(r.case) ? 'DIFF' : 'decl');
   for (const r of raw) console.log(`${mark(r)}  ${r.case}${r.same ? `\n        ${r.rs}` : `\n        whistle ${r.whistle}\n        rs      ${r.rs}`}`);
   for (const e of stale) console.log(`STALE ${e.case}: ${e.why}`);
   for (const r of oneSidedResults) console.log(`${r.ok ? 'ok  ' : 'FAIL'}  plugin: ${r.name}${r.ok ? '' : `\n        got    ${JSON.stringify(r.got)}\n        expect ${JSON.stringify(r.expect)}`}`);
-  console.log(`\nwhistle ${WHISTLE.version} — ran: ${raw.length}  differing: ${verdict.news.length}  declared: ${verdict.declared}  stale: ${stale.length}  one-sided: ${oneSidedResults.length} (${failed.length} failed)`);
-  process.exit(verdict.news.length || stale.length || failed.length ? 1 : 0);
+  for (const failure of expectationFailures) console.log('EXPECT FAIL ' + JSON.stringify(failure));
+  console.log(`\nwhistle ${WHISTLE.version} — ran: ${raw.length}  differing: ${verdict.news.length}  declared: ${verdict.declared}  stale: ${stale.length}  one-sided: ${oneSidedResults.length} (${failed.length} failed)  expectations: ${expectationChecks} (${expectationFailures.length} failed)`);
+  process.exit(verdict.news.length || stale.length || failed.length || expectationFailures.length ? 1 : 0);
 }
 
 main().catch((e) => { console.error(e); process.exit(2); });

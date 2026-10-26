@@ -280,6 +280,16 @@ const DECLARED = {
     d('tcp: a tunnel script that sends data of its own', ['answer'],
       'upstream writes the script\'s sendToClient into the tunnel before its own `200 Connection Established`, so the '
       + 'client sees bytes where the CONNECT answer should be and the tunnel never opens; here they follow the 200'),
+    ...[
+      'one invocation per message with interleaved ping',
+      'binary fragments preserve bytes and explicit binary output',
+      'UTF-8 codepoint split across fragments',
+      'drop the complete message without losing the next one',
+      'handler injections go before the reassembled message',
+      'empty fragments still form one message',
+    ].map((name) => only(['2.10.8'], 'frame-fragment: ' + name, ['answer'],
+      '2.10.8 invokes the client-bound handler for client messages, including reassembled fragments; '
+      + '2.10.10 and whix invoke the server-bound handler. The fragment cases independently assert both expected answers.')),
     // 2.10.8 hands a client's frame to the handler for *server* frames
     // (ws-bench.js header), so `handleSendToServerFrame` never sees one. Fixed
     // in 2.10.10, which is what this port follows.

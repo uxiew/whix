@@ -27,6 +27,7 @@
 | 2026-10-06 | 第五轮 R5-01…04 | 1 GB 历史启动时 18 MiB（以前 886 MiB），历史默认最多 1 GiB；崩掉的 Node 插件下一个请求就重新拉起（以前请求从此绕过插件直达源站）；引入卡住时 3 秒就回应（以前 48 秒）；默认日志不打请求 URL | [第五轮](#2026-10-06-第五轮历史插件进程与启动) |
 | 2026-10-03 | 第四轮 R4-01…03 | 一个数据目录只能有一个实例（以前第二个会悄悄盖掉第一个存的规则），嵌入时控制台不再写盘，并发启动只生成一张根证书；口令可以用环境变量给；没注入的 `weinre://` 不再去掉页面的 CSP | [第四轮](#2026-10-03-第四轮共用目录口令与白改的头) |
 | 2026-10-01 | 第二轮 EXT-01 / CTRL-01 | HTTPS / 全部规则 / 插件三个运行时开关，插件短协议、返回 values、自带规则；`resRulesServer` 给替代写法 | [第二轮](#2026-10-01-第二轮同名规则的实际效果) |
+| 2026-10-26 | WS-01 分片脚本 | 有界重组后执行一次处理函数；双版本真实代理对照及关闭／暂停／注入回归通过 | [WS-01](#2026-10-26-websocket-分片脚本与回归) |
 
 ## 结论
 
@@ -69,7 +70,7 @@
 | HTTP/2 / 连接 | 客户端到 MITM 侧支持 h2；客户端走 h2 时对 HTTPS 源站也用 h2（与 whistle 默认一致，`enable://h2`/`disable://h2` 可改），明文源站（`httpH2`）不支持。源站连接按客户端连接复用，不跨客户端 | `src/proxy/{pool,upstream}.rs`；`tests/differential/{h2,perf}-bench.js` |
 | CA / TLS | 动态 CA、自备证书和 SNI 插件钩子已实现；`tlsOptions://` 能给源站出示客户端证书（PEM、PFX）、指定信任的 CA（2026-10-01）；默认验证源站证书是有意的安全差异。证书安装仍由用户完成 | `src/ca.rs`、`src/proxy/{sni,tls_options}.rs`、`src/main.rs` |
 | 规则语义 | 模式、优先级、Values、includes、改写与响应阶段等有广泛实现；规则里的 `/…/` 按 JavaScript 正则解释，脚本环境的 `parseUrl`/`parseQuery`/`Buffer` 与 Node 一致（2026-10-01）；特定语料的差分通过，不代表所有输入和上游版本一致 | `src/rules/`、`src/proxy/apply/`、`src/proxy/script.rs`、`tests/differential/` |
-| WebSocket / 流 | 有 ws/wss 帧抓取、发送、扣留/放行及自有插件钩子；`frameScript` 每条连接一个脚本，管二进制帧和 `enable://inspect` 的 TCP 隧道（2026-10-01）；分片消息不交给脚本 | `src/proxy/{ws,script,tunnel}.rs`、`src/plugins/wsframe.rs` |
+| WebSocket / 流 | 有 ws/wss 帧抓取、发送、扣留/放行及自有插件钩子；`frameScript` 每条连接一个脚本，管二进制帧和 `enable://inspect` 的 TCP 隧道（2026-10-01）；分片脚本于 2026-10-26 补齐，范围见 [WS-01](#2026-10-26-websocket-分片脚本与回归) | `src/proxy/{ws,script,tunnel}.rs`、`src/plugins/wsframe.rs` |
 | 控制台 | Vue 3 + CodeMirror；已有规则/Values、Composer/重放、时间线、二进制预览/下载、HAR 与配置导入导出，**不是缺失项**；2026-10-01 加了 `log://` 的 Console 面板，和 HTTPS / 全部规则 / 插件三个运行时开关 | `ui-src/src/panes/`；`src/proxy/webui.rs` 路由表、`src/proxy/webui/` |
 | 检索与错误观测 | 检索框支持 `h:`、`b:`（由代理查，`b:` 只查已存的预览）、`fc:`；`app:` 明确不支持。失败的请求各有一条会话，带失败阶段和原因，本代理生成的 502 带阶段和会话号；命中了但没执行的算子记在会话的 `unapplied` 里（超上限、事件流、压缩解不开、插件钩子失败、cipher 用不了） | `ui-src/src/filter/session-filter.js`；`src/proxy/search.rs`；`src/proxy/outcome.rs`、`src/proxy/ledger.rs` 的 `Ledger`、`src/proxy/serve.rs` 的 `guard` |
 | 持久化 | JSONL 会话历史与按天保留；内存/体预览有界，没存全的 body 在接口、HAR、重放里都有标记，写盘读回不变。控制台隐藏不等于没采集，只有 `enable://hide` 不记录 | `src/proxy/{persist,body}.rs`、`src/proxy/webui/{sessions,har}.rs`、`src/config.rs` |
@@ -1329,3 +1330,41 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 证据（本地未入库）：`target/differential/expiry-clock-red-20261023/` 是旧夹具的定向复现（过滤语料还会产生未运行声明，不计作全量结果）；`expiry-clock-wrong-policy-20261023/` 保存故意错误策略的完整正文负例。最终网络为 `expiry-clock-final-20261023-2.10.8/`、`expiry-clock-final-20261023-2.10.10/`，快速套件为 `expiry-clock-fast-20261023-2.10.8/`、`expiry-clock-fast-20261023-2.10.10/`，矩阵为 `expiry-clock-final-20261023-matrix.json`，均在 `target/differential/` 下。复用上一轮已提交代理代码的冻结二进制，SHA-256 为 `9c4138fc468f24f0a1f6608813fc586a2fa8e43884a7f395d01dfbd179d6023d`。
 
 **边界：** 这是显式已知策略的窄范围检查，不是对所有动态日期的通用归一化；其他用例仍采用原比较规则。秒级舍入及受限观测窗口内的不确定性不能消除。本轮没有重跑完整 29 阶段、Rust／浏览器全套、跨平台或远端 CI；也没有修改上轮脚本初始化的性能取舍。只本地提交，不推送。
+
+
+## 2026-10-26 WebSocket 分片脚本与回归
+
+**完成：** WS-01。只在配置了 frameScript 处理函数的方向重组消息，再执行一次脚本；未处理方向保持原有逐帧转发。没有改脚本预算、插件接口或依赖。大小上限、控制帧及 Pause／Ignore 的行为统一写在 [脚本说明](RULES.md#脚本)。
+
+**旧实现确实失败：** 将新增 Rust 回归放回 `7a011c1` 的原始 `ws.rs` 后，第一条数据分片未经脚本就到达源站，断言失败。冻结的旧二进制对 Whistle 2.10.10 的 8 个新用例有 7 条差异，覆盖双向改写、二进制／UTF-8、丢弃、注入、空消息及状态计数；无处理函数方向是通过的负对照。源站最终使用锁定 `ws` 的 `stream()` 产生真实分片；首轮误用了会强制 FIN=1 的 `send()`，那份接收方向结果不作为验收证据。
+
+**新回归：** 5 条重组器测试、8 条隧道测试，覆盖精确上限与多一字节、非法续帧、双向字节保真、Ping/Pong、Close 回复、EOF 清理、暂停／忽略、脚本注入和脚本先于插件。新增双代理用例还独立断言预期内容；2.10.8 的 6 条旧方向缺陷逐例声明并固定旧版预期，不放宽其他声明。
+
+**顺带修正一条旧夹具的时序假设：** 首次完整 core 对照失败在原有嵌套注入用例，而非新增分片用例：第二条输入按 120 ms 定时发送，第一条回声尚未回来时，合法顺序会变成 ack-a、ack-b、echo-a、echo-b。用旧二进制、仅将其源站回声延迟 400 ms，复现相同差异；不是本次重组导致的字节乱序。现在该用例永久保留慢回声，收到第一条实际回声后才发第二条，并对两个版本各自的完整结果独立断言。取消这个因果等待的负例中，两代理返回完全相同的交错结果，仍触发 2 个预期失败并退出 1。另将分片预期的握手码故意改错，也在两边答案一致时失败；没有用排序、延时容差或重试抹平结果。
+
+**门禁隔离修复（`8e39d1b`）：** 快速套件加载上游解析器时会创建 Storage，原先没有覆盖 `WHISTLE_PATH`，写真实 Whistle 目录被沙箱拒绝。现在门禁将其固定到本次临时目录，并覆盖继承值；以不可写的继承路径做负向环境检查，两版快速门禁均通过，生成文件只出现在各自的临时目录。没有为真实数据目录申请写权限。
+
+**环境：** macOS arm64、Rust 1.98.1、Node 24.9.0、Chrome 154.0.8037.98。首次编译因磁盘不足失败；获准清理项目 debug 缓存后，以 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` 重建和检查，没有修改项目工具链或全局配置。Playwright 默认浏览器未安装，改用既有 Chrome 的全新临时配置，未安装依赖。
+
+| 检查 | 结果 |
+| --- | --- |
+| Rust 全部目标／文档测试 | 1263 通过、12 个既有忽略项未跑；文档 2 通过；其中 WS 相关 60 通过 |
+| fmt、Clippy `-D warnings`、前端 typecheck／build | 通过 |
+| 真实代理流量浏览器回归 | 7 条各重复 3 次，21/21 通过 |
+| Whistle 2.10.8／2.10.10 的 `frames,ws,core` | 各 3/3 阶段通过；每版 15／6／126 个对照，另有 4 条插件单边检查；未声明差异、过期声明均为 0 |
+| core 独立预期 | 每版 18 项检查通过，包含 8 条新增分片用例及既有注入用例；不是只比较两端相等 |
+| core 已声明差异 | 2.10.8 为 22 条，2.10.10 为 6 条；新增的 6 条只限定 2.10.8 的已知方向缺陷 |
+| 版本矩阵 | 退出码 0，同一冻结二进制 |
+| 快速门禁 | 两版各 5/5，通过不可写继承路径验证测试存储隔离 |
+| 隔离修复后的网络复验 | 两版各 8/8 分片用例、16 项端点预期通过 |
+
+证据均为未入库的本地合成测试产物：
+
+- 旧实现：`target/ws-fragment-original-red.log`；正确夹具的双版本基线为 `target/differential/ws-fragment-baseline-20261026-2.10.8/`、`ws-fragment-baseline-20261026-2.10.10/`。
+- 首轮 core 时序失败：`target/differential/ws-fragment-final-20261026-2.10.10/`；确定性旧二进制红／绿对照及取消等待负例：`target/differential/ws-fragment-order-probe/`；错误预期负例：`target/differential/ws-fragment-oracle-negative/`。
+- 最终网络：`target/differential/ws-fragment-verified-20261026-2.10.8/`、`ws-fragment-verified-20261026-2.10.10/`；矩阵为 `ws-fragment-verified-20261026-matrix.json`。冻结二进制 SHA-256：`8428a6c1ad9c0a0aa1bea87297ea60f7724fa46c6f5f6d6034246f04a72fa6ee`。
+- 快速门禁：`target/differential/ws-fragment-fast-isolated-20261026-2.10.8/`、`ws-fragment-fast-isolated-20261026-2.10.10/`；首次因未隔离被拒的运行保留在 `ws-fragment-fast-20261026-2.10.8/`，不计作通过。
+- 最终门禁隔离复验：`target/differential/ws-fragment-isolated-20261026-2.10.8/`、`ws-fragment-isolated-20261026-2.10.10/`，同一冻结二进制。
+- Rust 全套、文档、Clippy 和浏览器：`target/ws-fragment-all-tests.log`、`ws-fragment-doc-tests.log`、`ws-fragment-clippy.log`、`ws-fragment-browser-chrome.log`。
+
+**未验证：** 没有重跑全部 29 个网络阶段、MSRV、跨平台、远端 CI 或长时间高并发；不宣称与 Whistle 全量兼容。未修改真实代理数据、系统代理或证书信任库；只本地提交，不推送。TCP 隧道的暂停／忽略仍是独立待办。
