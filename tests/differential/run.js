@@ -319,6 +319,9 @@ const baseEnv = {
   WHISTLE_PKG,
   ...(ASSUME_BASELINE ? { DIFF_ASSUME_BASELINE: '1' } : {}),
   DIFF_STATE: dirs.state,
+  // Importing the parser constructs upstream storage before any proxy starts.
+  // Override inherited paths too: fast gates must never touch real Whistle data.
+  WHISTLE_PATH: path.join(dirs.state, 'whistle-home'),
   DIFF_HOST: HOST,
   TMPDIR: dirs.tmp,
 };
