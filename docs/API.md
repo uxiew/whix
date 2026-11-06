@@ -247,9 +247,9 @@ curl -s -X POST http://127.0.0.1:8899/api/switches -d '{"rules":true}'
 | `POST /api/sessions/clear` | `{ "ids": [1, 2] }` 清除指定会话；`{}` 清空列表。**只清内存**，已落盘的历史重启后会回来 |
 | `POST /api/sessions/import` | HAR 1.2 JSON，离线追加，不发请求；完整校验后才分配新 ID，见下文 |
 | `POST /api/sessions/purge` | 清空内存并删除全部会话文件；返回 `{ "ok": true, "files_deleted": N }` |
-| `GET /api/ws/status?id=N` | `live`、两方向的 `mode: pass/pause/ignore`、`paused` 与 `held` |
+| `GET /api/ws/status?id=N` | `live`、`can_send`（可手动发送 WebSocket 帧）、两方向的 `mode: pass/pause/ignore`、`paused` 与 `held` |
 | `POST /api/ws/release` | `{ "id": 1, "dir": "send" }`；方向为 send/receive，按该方向批量放行 |
-| `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；确实向活动连接发送数据 |
+| `POST /api/ws/send` | `{ "id": 1, "dir": "send", "data": "hello" }`；只向活动 WebSocket 连接发帧，TCP 不支持 |
 | `POST /api/ws/control` | `{ "id": 1, "dir": "send", "mode": "pause" }`；send/receive 分别控制，mode 为 pass/pause/ignore |
 | `POST /api/ws/abort` | `{ "id": 1 }`；立即断开两端，不等 Close 握手；重复调用返回 `closed: false` |
 
@@ -278,6 +278,20 @@ Requests 的 **Import HAR** 在确认后追加导入。文件与请求体上限 
 `/api/ws/send` 可加 `type: "binary", encoding: "base64"`，data 是严格 base64；默认仍为 UTF-8 文本。允许空帧。单帧最多 **8 MiB**，超过上限的入站帧会关闭连接；队列使用原有有界背压。手动发帧跳过暂停／忽略并使用正确方向的 mask；不经过 frameScript（既有差异）。UI 支持选择 Binary 和 Load frame file。
 
 正在转发或重组分片消息时，拒绝插入手动数据帧或进入／退出 Ignore，避免破坏消息边界；可恢复 Pause 等待完整消息结束，或主动 Disconnect。配置了 frameScript 处理函数的方向在重组完成后按一条完整消息显示和控制，重组上限及协议边界见 [脚本](RULES.md#脚本)。写入超时／传输失败会中止连接；主动断开会取消两方向任务并清理注册项，已关闭 ID 不能继续发帧。
+
+
+### TCP 隧道实时控制
+
+给普通 `CONNECT` 隧道或非 WebSocket 的 `Upgrade` 加上 `enable://inspect`，然后在 **Frames** 里操作两个方向的 **Pause / Pass / Ignore / Release / Disconnect**。`pauseSend`、`pauseReceive`、`ignoreSend`、`ignoreReceive` 规则会自动开启 inspect，并决定连接的初始状态。没有开启检查的普通透传连接不注册控制接口。
+
+沿用上面的 `/api/ws/status`、`control`、`release`、`abort` 路径，避免改动已有客户端。TCP 的 `can_send` 为 false：界面不显示 WebSocket 发帧框，`/api/ws/send` 也不会把帧头写进原始 TCP 数据。未知／关闭 ID 的状态为 `live:false`，重复 Disconnect 无副作用。
+
+- **Pause 只保留一个块，然后停止读这一方向。** 没有不断增长的队列；原始读取每块最多 64 KiB，有 frameScript 时保留一个改写后的块，沿用已有脚本执行约束，不另加正文大小策略。`held` 是扣留块数，不是 TCP 协议的数据包数。
+- **Pass／Release 按顺序发送扣留内容；Ignore 丢掉扣留块与该方向后续数据。** 快速 Ignore → Pass 不会复活旧数据。已经开始写出的块不会被追回；脚本先处理，脚本主动发送的内容仍绕过 Pause／Ignore。
+- **TCP 不发送代理伪造的 Ping/Pong。** 一侧读到 EOF 只结束对应写半边，反向仍可发送最后的响应；传输错误或 Disconnect 结束两方向并清理控制。暂停停止读取后，不能立即探知这个方向的 EOF，需要恢复或主动断开，不另设猜测对端已死的定时器。
+- **隐藏连接仍执行规则／脚本，但不暴露捕获或控制句柄。** `show` 仍可覆盖 `hide`；隐藏且暂停的连接也不能从界面手动恢复。清空可见列表不等于断开活动连接。
+
+固定对照的 Whistle **2.10.8／2.10.10** 有一项实际不同：TCP 恢复暂停时，上游先上报并清空扣留块，再调用恢复回调，导致该块被丢弃。whix 保留数据，不模拟这个缺陷。差分逐项检查恢复后的唯一标记，区分“恢复但丢块”与“仍然堵塞”；详情和证据见 [本轮记录](STATUS.md#2026-11-06-tcp-隧道方向控制)。
 
 
 ## 页面日志

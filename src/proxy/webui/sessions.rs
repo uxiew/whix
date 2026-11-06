@@ -356,16 +356,26 @@ pub(super) fn json_value(body: &serde_json::Value) -> Response<DynBody> {
         .unwrap()
 }
 
-/// Whether either direction of one live WebSocket session is being held, and how
+fn connection_signal(state: &AppState, id: u64) -> Option<tokio::sync::watch::Sender<bool>> {
+    let websocket = state
+        .ws_write
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|w| w.close_signal());
+    websocket.or_else(|| state.tcp_closed.lock().unwrap().get(&id).cloned())
+}
+
+fn connection_live(state: &AppState, id: u64) -> bool {
+    connection_signal(state, id).is_some_and(|closed| !*closed.borrow())
+}
+
+/// Whether either direction of one live connection is being held, and how
 /// much of it (`?id=<session>`).
 ///
-/// Only a session `enable://pauseSend|pauseReceive` held is registered, so
-/// `live: false` covers "never paused" and "already closed" alike — which is all
-/// the console can act on anyway. It answers for an unknown id rather than
-/// failing, because this is what the Frames tab polls.
-///
-/// Every intercepted connection is controllable, including one initially
-/// passing traffic. The live flag clears as soon as disconnect is requested.
+/// WebSocket and inspected TCP share direction controls. Only WebSocket has
+/// frame writers; `can_send` keeps the console from framing raw TCP bytes.
+/// Unknown/closed sessions return `live: false`, as expected by polling.
 pub(super) fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Response<DynBody> {
     let want = query_id(req);
     let found = want.and_then(|id| state.ws_pause.lock().unwrap().get(&id).cloned());
@@ -376,20 +386,11 @@ pub(super) fn ws_status(state: &Arc<AppState>, req: &Request<Incoming>) -> Respo
         }
         None => serde_json::json!({ "paused": false, "held": 0, "mode": "pass" }),
     };
-    // `live` used to mean "somebody is holding this one", because a pause was
-    // the only reason to register a session. It now means what it says: the
-    // connection is open, which is also what decides whether a frame can be
-    // sent into it.
-    let open = want.is_some_and(|id| {
-        state
-            .ws_write
-            .lock()
-            .unwrap()
-            .get(&id)
-            .is_some_and(|w| w.live())
-    });
+    let open = want.is_some_and(|id| connection_live(state, id));
+    let can_send = open && want.is_some_and(|id| state.ws_write.lock().unwrap().contains_key(&id));
     let body = serde_json::json!({
         "live": open,
+        "can_send": can_send,
         "send": dir(found.as_ref().map(|p| &p.send)),
         "receive": dir(found.as_ref().map(|p| &p.receive)),
     });
@@ -412,10 +413,10 @@ pub(super) async fn ws_release(state: &Arc<AppState>, req: Request<Incoming>) ->
     };
     let name = payload.get("dir").and_then(|v| v.as_str()).unwrap_or("");
     let found = state.ws_pause.lock().unwrap().get(&id).cloned();
-    let Some(pause) = found else {
+    let Some(pause) = found.filter(|_| connection_live(state, id)) else {
         // The session ended while its frames were held. They stay flagged in the
         // capture, which is the truth: they never reached the peer.
-        return json_error("no live paused WebSocket session with that id");
+        return json_error("no live controllable session with that id");
     };
     let Some(gate) = pause.dir(name) else {
         return json_error("dir must be \"send\" or \"receive\"");
@@ -523,18 +524,9 @@ pub(super) async fn ws_control(state: &Arc<AppState>, req: Request<Incoming>) ->
     else {
         return json_error("mode must be pass, pause or ignore");
     };
-    if !state
-        .ws_write
-        .lock()
-        .unwrap()
-        .get(&id)
-        .is_some_and(|w| w.live())
-    {
-        return json_error("no live WebSocket session with that id");
-    }
     let pause = state.ws_pause.lock().unwrap().get(&id).cloned();
-    let Some(pause) = pause else {
-        return json_error("no live WebSocket session with that id");
+    let Some(pause) = pause.filter(|_| connection_live(state, id)) else {
+        return json_error("no live controllable session with that id");
     };
     let Some(gate) = input["dir"].as_str().and_then(|d| pause.dir(d)) else {
         return json_error("dir must be send or receive");
@@ -553,10 +545,10 @@ pub(super) async fn ws_abort(state: &Arc<AppState>, req: Request<Incoming>) -> R
     let Some(id) = input["id"].as_u64() else {
         return json_error("id is required");
     };
-    let writers = state.ws_write.lock().unwrap().get(&id).cloned();
-    let closed = writers.as_ref().is_some_and(|w| w.live());
-    if let Some(writers) = writers {
-        writers.abort();
+    let signal = connection_signal(state, id);
+    let closed = signal.as_ref().is_some_and(|signal| !*signal.borrow());
+    if let Some(signal) = signal {
+        signal.send_replace(true);
     }
     json_value(&serde_json::json!({"ok":true,"closed":closed}))
 }

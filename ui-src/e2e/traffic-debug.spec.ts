@@ -123,8 +123,8 @@ test('New cancels a delayed captured-body load rather than overwriting the new c
   await expect(page.getByLabel('URL', { exact: true })).toHaveValue('http://traffic.test/new');
 });
 
-async function openFrames(page: Page, request: APIRequestContext) {
-  await post(request, origin + '/ws/open');
+async function openFrames(page: Page, request: APIRequestContext, kind = 'ws') {
+  await post(request, origin + `/${kind}/open`);
   await expect.poll(async () => (await (await request.get('/sessions.json')).json()).length).toBe(1);
   await page.reload();
   await page.locator('.requests tbody tr').click();
@@ -214,4 +214,36 @@ test('a delayed status poll cannot undo a newly applied WebSocket mode', async (
   release(); await (await finished).finished();
   await expect(page.getByLabel('send mode')).toHaveValue('pause');
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+});
+
+
+test('inspected raw TCP uses live direction controls without a WebSocket composer', async ({ page, request }) => {
+  await post(request, '/api/rules', 'traffic.test host://127.0.0.1:25197 enable://inspect');
+  const id = await openFrames(page, request, 'tcp');
+  await expect(page.getByLabel('Frame to send')).toHaveCount(0);
+  const received = async (side: 'fromClient' | 'fromServer') => {
+    const records: { base64: string }[] = (await peers(request))[side];
+    return Buffer.concat(records.map((r) => Buffer.from(r.base64, 'base64'))).toString('base64');
+  };
+  for (const [dir, endpoint, side] of [
+    ['send', 'client-send', 'fromClient'], ['receive', 'server-send', 'fromServer'],
+  ] as const) {
+    await page.getByLabel(`${dir} mode`).selectOption('pause');
+    await post(request, `${origin}/tcp/${endpoint}`, { base64 });
+    await expect.poll(async () => (await (await request.get('/api/ws/status?id=' + id)).json())[dir].held).toBe(1);
+    expect(await received(side)).toBe('');
+    await page.getByRole('button', { name: 'Release', exact: true }).click();
+    await expect.poll(() => received(side)).toBe(base64);
+    await page.getByLabel(`${dir} mode`).selectOption('ignore');
+    await post(request, `${origin}/tcp/${endpoint}`, { base64: 'ZHJvcA==' });
+    await expect.poll(async () => (await (await request.get('/frames.json?id=' + id)).json())
+      .some((f: { dir: string; ignored: boolean }) => f.dir === dir && f.ignored)).toBe(true);
+    expect(await received(side)).toBe(base64);
+    await page.getByLabel(`${dir} mode`).selectOption('pass');
+    await post(request, `${origin}/tcp/${endpoint}`, { base64: 'bmV4dA==' });
+    await expect.poll(() => received(side)).toBe(Buffer.concat([bytes, Buffer.from('next')]).toString('base64'));
+  }
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await expect.poll(async () => { const s = await peers(request); return [s.clientLive, s.serverLive]; }).toEqual([false, false]);
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toHaveCount(0);
 });

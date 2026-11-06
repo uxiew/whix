@@ -1367,9 +1367,9 @@ db.internal:5432        frameScript://{frame.js} enable://inspect
 协议的 `Upgrade:`，都是按字节转发的。加上 `enable://inspect` 后，从任一侧读到的每个
 数据块都会作为一帧显示在隧道那一行下面，并交给脚本。一个数据块就是一次读取返回的内容：
 TCP 没有消息边界，需要完整消息的处理函数得自己拼起来，在上游也一样。
-`enable://pauseSend` 和它的三个同类会隐含 `inspect`，在隧道上除此之外什么也不做。
+`enable://pauseSend` 和它的三个同类会隐含 `inspect`，并控制对应方向；运行时操作与字节边界见 [TCP 隧道实时控制](API.md#tcp-隧道实时控制)。
 
-和 whistle 2.10.10 不同的地方如下，每一条都由 `tests/differential/core-bench.js` 实测
+和 whistle 2.10.10 不同的地方如下，由 `core-bench.js` 与 `tcp-controls-bench.js` 实测
 （具体用例数与结果见 [STATUS](STATUS.md)）：
 
 | | whistle | 这里 | 原因 |
@@ -1379,7 +1379,7 @@ TCP 没有消息边界，需要完整消息的处理函数得自己拼起来，�
 | 脚本顶层调用 `sendToServer`，同时又装了这个方向的处理函数 | 这一帧永远到不了 | 能到，会经过处理函数 | — |
 | **隧道**脚本顶层调用 `sendToClient` | 写在回应 CONNECT 的 `200` 之前；客户端的 CONNECT 失败 | 写在它之后 | — |
 | `typeof ctx.frame`、`typeof ctx.direction` | `undefined` | 一个对象和一个字符串 | 本项目的单行写法，见下文 |
-| 隧道上的 `enable://pauseSend` … | 暂停或丢弃数据块 | 只是显示，别的不做 | 没实现 |
+| TCP 恢复暂停 | 丢弃扣留块 | 按顺序放行 | 保留数据，见 [TCP 控制](API.md#tcp-隧道实时控制) |
 
 客户端的帧交给 `handleSendToServerFrame`，和名字说的一样。在普通 WebSocket 上，
 whistle 2.10.9 及之前是交给 `handleSendToClientFrame` 的；2.10.10 修好了
@@ -1581,7 +1581,7 @@ example.com/old    locationHref://replace:/new
 
 | 算子 | 值 | 作用 |
 |----------|-------|--------|
-| `enable` | 开关（可多个） | `abort`/`abortReq`/`abortRes`（销毁连接，见下文）、`cors`（等同于 `resCors://enable`）、`captureStream`（让源站别压缩）、`gzip`/`br`/`deflate`（强制响应发出去时用这种编码）、`showHost`（把实际连到的地址写进 `x-host-ip`）、`ignoreSend`/`ignoreReceive`（丢掉 WebSocket 的一个方向）、`pauseSend`/`pauseReceive`（扣住 WebSocket 的一个方向，直到控制台放行）、`safeHtml`/`strictHtml`（每次注入前都先检查一道）、`keepCSP`/`keepCache`/`keepAllCache`（发生注入时照样保留）、`hide`/`show`（不让请求进抓包记录，或者把它放回来，见下文）、`websocket`（不管升级请求自称什么，都当 WebSocket 解析）、`h2`/`http2`/`httpsH2`（向 HTTPS 源站提供 HTTP/2，见下文） |
+| `enable` | 开关（可多个） | `abort`/`abortReq`/`abortRes`（销毁连接，见下文）、`cors`（等同于 `resCors://enable`）、`captureStream`（让源站别压缩）、`gzip`/`br`/`deflate`（强制响应发出去时用这种编码）、`showHost`（把实际连到的地址写进 `x-host-ip`）、`ignoreSend`/`ignoreReceive`（丢掉 WebSocket／TCP 隧道的一个方向）、`pauseSend`/`pauseReceive`（扣住 WebSocket／TCP 隧道的一个方向，直到控制台放行）、`safeHtml`/`strictHtml`（每次注入前都先检查一道）、`keepCSP`/`keepCache`/`keepAllCache`（发生注入时照样保留）、`hide`/`show`（不让请求进抓包记录，或者把它放回来，见下文）、`websocket`（不管升级请求自称什么，都当 WebSocket 解析）、`h2`/`http2`/`httpsH2`（向 HTTPS 源站提供 HTTP/2，见下文） |
 | `disable` | 开关（可多个） | 见下面两张表 |
 | `trailers` | `name=value` / `{json}` | 给 HTTP 响应加 trailer 头（会强制使用 chunked），见下文 |
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | 改写某个头的值；scope 取 `req.`/`reqH.`/`res.`/`resH.` |

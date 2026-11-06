@@ -548,3 +548,15 @@ cargo test --locked --test script_startup concurrent_script_startup_keeps_result
 其他字段的差异也不能因此放过。独立校验错误在差异豁免判定之后加入最终失败列表，无法
 被既有声明消掉。结果中的 `raw` 保留原始日期差异，`clockChecks` 保存期望窗口和实测
 证据。旧的一秒日期判定没有扩容；本机制只适用于显式标记的用例。
+
+
+## TCP 隧道方向控制
+
+```sh
+node run.js network --only tcp-control
+node run.js network --only tcp-control --whistle 2.10.10
+```
+
+`tcp-controls-bench.js` 使用现有双代理和独立回环 TCP 对端，逐项核对两个方向的暂停／恢复、忽略／恢复、丢弃旧扣留块及脚本改写，共 7 项，每版 14 个独立预期。比较的是连续字节，不依赖操作系统如何分块；该阶段已加入网络门禁，报告保留原始差异及 `expectationFailures`。
+
+上游会先把 CONNECT 放进列表，再异步建立控制器；夹具须等 `get-data` 的 `data.socketStatus` 对象出现，不能把无条件返回的 `ec:0` 当作已控制连接。恢复后总会发送标记，确保对端确实恢复了传输。三个暂停用例的上游差异及产品取舍只写在 [TCP 控制契约](../../docs/API.md#tcp-隧道实时控制)；未知差异、过期声明或任一独立预期失败均非零退出。

@@ -219,6 +219,7 @@ export interface WsDirPause {
  */
 export interface WsPauseStatus {
   live: boolean;
+  can_send?: boolean;
   send: WsDirPause;
   receive: WsDirPause;
 }

@@ -36,6 +36,8 @@ defineProps<{ frames: WsFrame[] | null }>();
 
 /** Is the connection still open? Only then can a frame be sent into it. */
 const live = computed(() => !!state.wsPause?.live);
+// Older consoles omit this capability; raw TCP explicitly disables WS framing.
+const canSend = computed(() => live.value && state.wsPause?.can_send !== false);
 
 /** The directions this connection is currently holding, if it is still live. */
 const holds = computed(() => {
@@ -63,7 +65,7 @@ onUnmounted(stopPolling);
   <!-- The Frames composer: a message to either end of a connection that is
        still open. It is the one thing a capture cannot answer on its own —
        what the *other* side does with something it has not been sent yet. -->
-  <div v-if="live" class="ws-compose">
+  <div v-if="canSend" class="ws-compose">
     <select v-model="binary" aria-label="Frame format"><option :value="false">Text</option><option :value="true">Binary · Base64</option></select>
     <input
       v-model="state.wsCompose"

@@ -22,9 +22,12 @@ pub struct AppState {
     pub sessions: Mutex<VecDeque<Session>>,
     /// Bounded ring buffer of captured WebSocket frames, keyed by session id.
     pub ws_frames: Mutex<VecDeque<WsFrame>>,
-    /// Per-direction pass/pause/ignore controls for every live intercepted
-    /// connection. Registered with its writers and removed when the tunnel ends.
+    /// Direction controls for live WebSocket and inspected TCP connections.
+    /// TCP registers no frame writer; both unregister when their relay ends.
     pub ws_pause: Mutex<HashMap<u64, Arc<ws::SessionPause>>>,
+    /// TCP has no WebSocket writer entry; its relay owns the sockets and only
+    /// publishes this cancellation signal for the console.
+    pub(super) tcp_closed: Mutex<HashMap<u64, tokio::sync::watch::Sender<bool>>>,
     /// The live WebSocket sessions the console can write into — one entry per
     /// intercepted connection, removed when it ends.
     ///
@@ -112,6 +115,7 @@ impl AppState {
             sessions: Mutex::new(VecDeque::new()),
             ws_frames: Mutex::new(VecDeque::new()),
             ws_pause: Mutex::new(HashMap::new()),
+            tcp_closed: Mutex::new(HashMap::new()),
             ws_write: Mutex::new(HashMap::new()),
             page_logs: Mutex::new(pagelog::PageLogs::default()),
             intercept_https,

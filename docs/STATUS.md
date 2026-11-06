@@ -28,6 +28,7 @@
 | 2026-10-03 | 第四轮 R4-01…03 | 一个数据目录只能有一个实例（以前第二个会悄悄盖掉第一个存的规则），嵌入时控制台不再写盘，并发启动只生成一张根证书；口令可以用环境变量给；没注入的 `weinre://` 不再去掉页面的 CSP | [第四轮](#2026-10-03-第四轮共用目录口令与白改的头) |
 | 2026-10-01 | 第二轮 EXT-01 / CTRL-01 | HTTPS / 全部规则 / 插件三个运行时开关，插件短协议、返回 values、自带规则；`resRulesServer` 给替代写法 | [第二轮](#2026-10-01-第二轮同名规则的实际效果) |
 | 2026-10-26 | WS-01 分片脚本 | 有界重组后执行一次处理函数；双版本真实代理对照及关闭／暂停／注入回归通过 | [WS-01](#2026-10-26-websocket-分片脚本与回归) |
+| 2026-11-06 | TCP-01 隧道方向控制 | 双向暂停／忽略与恢复、单块背压、半关闭及隐藏连接边界已验证 | [TCP-01](#2026-11-06-tcp-隧道方向控制) |
 
 ## 结论
 
@@ -1368,3 +1369,36 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 - Rust 全套、文档、Clippy 和浏览器：`target/ws-fragment-all-tests.log`、`ws-fragment-doc-tests.log`、`ws-fragment-clippy.log`、`ws-fragment-browser-chrome.log`。
 
 **未验证：** 没有重跑全部 29 个网络阶段、MSRV、跨平台、远端 CI 或长时间高并发；不宣称与 Whistle 全量兼容。未修改真实代理数据、系统代理或证书信任库；只本地提交，不推送。TCP 隧道的暂停／忽略仍是独立待办。
+
+
+## 2026-11-06 TCP 隧道方向控制
+
+**完成：** TCP-01。检查模式的 CONNECT 和非 WebSocket Upgrade 现在支持规则初始化及运行时双向 Pause／Pass／Ignore／Release／Disconnect。原始字节转发独立放在 `src/proxy/ws/tcp.rs`，复用已有方向状态及 API，不增加依赖、通用策略框架或额外超时。原 `ws::inspected_relay` 函数和 `SessionPause` 的公开构造保留；WebSocket 关闭信号不改，TCP 仅登记自己的取消句柄。完整行为只写在 [TCP 控制契约](API.md#tcp-隧道实时控制)。
+
+**回归证据：** 原实现的真实 CONNECT 测试等不到扣留状态，明确失败；修复后对端在 Release 前收不到数据，之后按顺序收到原字节。新增 6 条内部流测试、4 条真实进程测试覆盖快速 Ignore → Pass、后续 Pause 不受旧丢弃状态污染、单块背压、阻塞写入取消、I/O 错误、半关闭、重复断开、非法输入、拒绝 TCP 的 WebSocket 注入和脚本顺序。真实浏览器另覆盖 raw Upgrade 的双向控制与发帧框隐藏。
+
+独立审查发现 raw Upgrade 将隐藏会话的分配 ID 无条件传给抓取器：列表为空时仍可读到帧，也会暴露本轮新增控制。永久测试修复前得到 2 个不应存在的帧，修复后为 0；可见性直接取既有规则判定，不查可淘汰的会话缓存，同时验证 `show` 覆盖 `hide`、隐藏时脚本照常改写。审查还促使关闭句柄与公开方向类型分离，避免破坏外部结构体构造。
+
+**Whistle 对照：** 2.10.8／2.10.10 都先记录 CONNECT、后异步建立控制器；夹具已改为等待真正可控，而不是只认列表和 `ec:0`。两版上游恢复暂停都会丢弃扣留块，已由不改行为的观测代码确认 `emitData` 清空块后恢复回调收到 null。whix 不复制这个丢数据行为，只有 3 条逐用例、逐版本的差异声明。每次恢复后发送唯一标记，以实际标记到达作为观察边界，避免把缺失字节误报成超时。
+
+环境：macOS arm64、Rust 1.98.1、Node 24.9.0、Chrome 157.0.8103.39。Rust 检查沿用 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`；未改工具链、依赖锁文件或全局环境。
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test --locked --all-targets`／文档测试 | 1273 通过、12 项既有忽略未跑；文档 2 通过 |
+| WS／TCP 内部相关回归 | 66 通过；新真实进程回归 4/4，通过隐藏与 show 两种分支 |
+| fmt、Clippy `-D warnings`、前端 typecheck／build | 通过 |
+| 真实代理流量浏览器回归 | 8 项重复 3 次，24/24 通过 |
+| 双版本 `frames,ws,tcp-control,core` | 各 4/4 阶段通过，每版 15／6／7／126 项对照及 4 项插件单边检查；未声明差异和失效声明均为 0 |
+| 新 TCP 对照 | 每版 7 项、14 个独立预期通过；恢复观察改为标记到达后，两版再跑均通过 |
+| 快速门禁／版本矩阵 | 两版各 5/5；同一冻结二进制的矩阵退出码 0 |
+| 派生夹具负例 | 仅模拟 whix 丢失扣留内容，不修改代理；两端观察结果全部相同，仍得到 3 个 whix 固定预期失败并退出 1，不能算双代理通过 |
+
+证据均为未入库的本地合成流量产物：
+
+- 红灯：`target/tcp-controls-red-20261106.log`、`tcp-hidden-upgrade-red-20261106.log`。最终 Rust／Clippy／浏览器：`target/tcp-controls-all-final-20261106.log`、`tcp-controls-doc-final-20261106.log`、`tcp-controls-clippy-final-20261106.log`、`tcp-controls-browser-final-20261106.log`。
+- 上游控制就绪与丢块诊断：`target/tcp-oracle-diagnosis/`，包含两个版本的无行为修改追踪及独立只读审查复现。最初未等待控制器的 `tcp-controls-initial-*`／`tcp-controls-diagnostic-*` 不作为通过证据。
+- 网络：`target/differential/tcp-controls-final-20261106-2.10.8/`、`tcp-controls-final-20261106-2.10.10/`；TCP 标记边界复验：`tcp-controls-marker-20261106-2.10.8/`、`tcp-controls-marker-20261106-2.10.10/`；快速门禁：`tcp-controls-fast-20261106-2.10.8/`、`tcp-controls-fast-20261106-2.10.10/`；矩阵：`tcp-controls-matrix-20261106.json`，均在 `target/differential/`。
+- 模拟错误观察值的负例：`target/tcp-controls-oracle-negative/`、`target/differential/tcp-controls-negative-20261106/`。冻结二进制 SHA-256：`4db294aacee0540bde10260a197fe992116795ed6c6e699822905c4680140d83`。
+
+**边界：** 未跑全部 30 个网络阶段、MSRV、跨平台、远端 CI、长期并发或真实外部网络测试，不宣称全量兼容。没有新增 TCP 手动注入，也没有把 TCP 的暂停等待包装成能立即发现对端离开的功能。没有修改真实代理数据、系统代理或证书信任库；只本地提交，不推送。

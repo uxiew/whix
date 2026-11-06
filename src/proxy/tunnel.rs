@@ -545,8 +545,9 @@ pub(super) struct Tunnel<'a> {
 ///
 /// Upstream's `isInspect` (`_original/lib/util/index.js:3336-3344`) also takes
 /// `pauseSend`, `pauseReceive`, `ignoreSend` and `ignoreReceive` for the same
-/// thing, and so does this; on a tunnel they do nothing more than that here.
+/// thing. The direction modes are carried into the byte relay.
 pub(super) struct Inspect {
+    flow: ws::FrameFlow,
     script: Option<script::FrameScriptSpec>,
 }
 
@@ -570,6 +571,7 @@ pub(super) fn inspect_of(
         tpl_ctx(&host, state.config.port, info),
     );
     Some(Inspect {
+        flow: ws::FrameFlow::of(&resolved),
         script: frame_script_of(state, info, &resolved),
     })
 }
@@ -722,7 +724,7 @@ where
     let relayed = match inspect {
         // Chunk by chunk, each one a frame of this tunnel's session.
         Some((inspect, state, id)) => {
-            ws::inspected_relay(client, origin, inspect.script, state, id)
+            ws::inspected_relay_with_flow(client, origin, inspect.script, inspect.flow, state, id)
                 .await
                 .map_err(Into::into)
         }

@@ -244,6 +244,9 @@ pub(super) async fn serve_upgrade(
         return Ok(Response::from_parts(p, body::from_incoming(b)));
     }
 
+    // A hidden upgrade still runs rules/scripts, but its allocated id must not
+    // expose captures or controls. Derive visibility from rules, not the cache.
+    let raw_capture = (!apply::hidden_from_capture(resolved)).then_some(session_id);
     let upstream_upgrade = hyper::upgrade::on(&mut resp);
     let (p, _b) = resp.into_parts();
     let state = state.clone();
@@ -270,8 +273,15 @@ pub(super) async fn serve_upgrade(
                 } else if inspected {
                     // Some other protocol, which a rule asked to see: chunk by
                     // chunk, each one a frame and each one offered to the script.
-                    let relayed =
-                        ws::inspected_relay(c, u, frame_script, state, Some(session_id)).await;
+                    let relayed = ws::inspected_relay_with_flow(
+                        c,
+                        u,
+                        frame_script,
+                        frame_flow,
+                        state,
+                        raw_capture,
+                    )
+                    .await;
                     if let Err(err) = relayed {
                         tracing::debug!("upgrade tunnel closed: {err}");
                     }

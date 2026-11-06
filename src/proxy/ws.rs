@@ -29,6 +29,10 @@
 //! exempt, because upstream pauses the byte stream rather than the frames in it.
 
 mod message;
+mod tcp;
+
+pub use tcp::inspected_relay;
+pub(crate) use tcp::inspected_relay_with_flow;
 
 use message::Messages;
 use std::io;
@@ -475,6 +479,10 @@ impl SessionWriters {
         self.send_payload(dir, OPCODE_BINARY, data).await
     }
 
+    pub(crate) fn close_signal(&self) -> tokio::sync::watch::Sender<bool> {
+        self.closed.clone()
+    }
+
     pub fn live(&self) -> bool {
         !*self.closed.borrow()
     }
@@ -724,13 +732,8 @@ const MAX_HELD_FRAMES: usize = 64;
 /// The byte half of [`MAX_HELD_FRAMES`].
 const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
 
-/// The pause state of one live WebSocket session: what the console reads, and
-/// what it releases.
-///
-/// Present in [`AppState::ws_pause`](crate::proxy::AppState::ws_pause) for
-/// exactly as long as the tunnel runs. A release for a session that has since
-/// closed finds nothing, which is the honest answer — its held frames stay
-/// flagged in the capture, having never been delivered.
+/// Direction controls of one live WebSocket or inspected TCP session.
+/// Held captures remain marked if the connection closes without releasing them.
 #[derive(Default)]
 pub struct SessionPause {
     /// Frames travelling client → server.
@@ -1391,165 +1394,13 @@ fn dropped(fin: bool, opcode: u8) -> Option<Bytes> {
     fragment.then(Bytes::new)
 }
 
-// ── a tunnel a rule asked to see ───────────────────────────────────────────
-
-/// How much one read of an inspected tunnel takes at most — and so the most a
-/// handler is handed at once. Node's socket reads are 64 KiB.
-const CHUNK: usize = 64 * 1024;
-
-/// Relay a tunnel **chunk by chunk**, because a rule said `enable://inspect`.
-///
-/// A tunnel that is not read — anything that is not HTTP or a TLS handshake
-/// this proxy intercepts, or one a rule said to leave alone — is ordinarily a
-/// `copy_bidirectional`, and nothing about it is visible. With
-/// `enable://inspect` upstream shows each chunk in the Frames panel and hands
-/// it to the connection's `frameScript` (`handleConnSend` / `handleConnReceive`,
-/// `_original/lib/socket-mgr.js:125-205`): [`frameScript.md`] is for
-/// "WebSocket 和普通 TCP 请求数据帧", and until 2026-09-30 only the first half
-/// was true here.
-///
-/// A "frame" on a tunnel is whatever one read returned. TCP has no message
-/// boundaries, so a handler that needs a whole message has to reassemble it
-/// itself — upstream's does too.
-///
-/// `enable://pauseSend` and the other three are not honoured on a tunnel; they
-/// imply `inspect` upstream and do here, and that is all they do.
-///
-/// [`frameScript.md`]: https://wproxy.org/docs/rules/frameScript.html
-pub async fn inspected_relay<C, O>(
-    client: C,
-    origin: O,
-    script: Option<FrameScriptSpec>,
-    state: Arc<AppState>,
-    session: Option<u64>,
-) -> io::Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-    O: AsyncRead + AsyncWrite + Unpin,
-{
-    let started = match script {
-        Some(spec) => FrameScript::start(spec).await,
-        None => FrameScriptStart::default(),
-    };
-    let (client_read, client_write) = tokio::io::split(client);
-    let (origin_read, origin_write) = tokio::io::split(origin);
-    // Each write half behind a lock: a handler running for one direction may
-    // send bytes the other way, and a chunk must not land inside another.
-    let pipe = TunnelPipe {
-        to_server: tokio::sync::Mutex::new(origin_write),
-        to_client: tokio::sync::Mutex::new(client_write),
-        script: started.script,
-        state,
-        session,
-    };
-    // What the script sent while it was being evaluated goes first. The CONNECT
-    // has been answered by now, so bytes toward the client are tunnel bytes —
-    // upstream writes them *before* its `200`, and the client's CONNECT then
-    // fails on a status line it cannot read.
-    for frame in &started.sent {
-        pipe.write(frame.to_server, &frame.data).await?;
-    }
-    let up = pipe.pump(client_read, true);
-    let down = pipe.pump(origin_read, false);
-    let (up, down) = tokio::join!(up, down);
-    up.and(down)
-}
-
-/// The two write halves of an inspected tunnel, and what looks at its chunks.
-struct TunnelPipe<S, C> {
-    to_server: tokio::sync::Mutex<S>,
-    to_client: tokio::sync::Mutex<C>,
-    script: Option<FrameScript>,
-    state: Arc<AppState>,
-    /// The session the chunks are filed under; `None` for a hidden tunnel,
-    /// whose script runs and whose chunks are not kept.
-    session: Option<u64>,
-}
-
-impl<S, C> TunnelPipe<S, C>
-where
-    S: AsyncWrite + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    /// Write one chunk toward either end, and record it as a frame.
-    async fn write(&self, to_server: bool, data: &[u8]) -> io::Result<()> {
-        if to_server {
-            let mut w = self.to_server.lock().await;
-            w.write_all(data).await?;
-            w.flush().await?;
-        } else {
-            let mut w = self.to_client.lock().await;
-            w.write_all(data).await?;
-            w.flush().await?;
-        }
-        let Some(session) = self.session else {
-            return Ok(());
-        };
-        // Filed as text when it is text, so the Frames panel shows it as
-        // written rather than as hex; a tunnel's bytes have no type of their
-        // own.
-        let opcode = match std::str::from_utf8(data) {
-            Ok(_) => OPCODE_TEXT,
-            Err(_) => OPCODE_BINARY,
-        };
-        let direction = if to_server { "send" } else { "receive" };
-        self.state
-            .record_frame(WsFrame::new(session, direction, opcode, data));
-        Ok(())
-    }
-
-    /// No more bytes will come this way: tell the far end, as a plain relay's
-    /// half-close does.
-    async fn finish(&self, to_server: bool) {
-        if to_server {
-            let _ = self.to_server.lock().await.shutdown().await;
-        } else {
-            let _ = self.to_client.lock().await.shutdown().await;
-        }
-    }
-
-    /// One direction: read a chunk, let the script see it, write what is left.
-    async fn pump<R: AsyncRead + Unpin>(&self, mut from: R, to_server: bool) -> io::Result<()> {
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = match from.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(err) => {
-                    self.finish(to_server).await;
-                    return Err(err);
-                }
-            };
-            let chunk = &buf[..n];
-            let Some(script) = self.script.as_ref().filter(|s| s.handles(to_server)) else {
-                self.write(to_server, chunk).await?;
-                continue;
-            };
-            let outcome = script
-                .relay(ScriptFrame {
-                    to_server,
-                    data: chunk.to_vec(),
-                    binary: true,
-                })
-                .await;
-            for sent in &outcome.sent {
-                self.write(sent.to_server, &sent.data).await?;
-            }
-            if let Some(kept) = outcome.frame {
-                self.write(to_server, &kept.data).await?;
-            }
-        }
-        self.finish(to_server).await;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     mod concurrency_cases;
     mod control_cases;
     mod fragment_cases;
     mod script_startup_cases;
+    mod tcp_control_cases;
     use super::*;
     use crate::ca::CertAuthority;
     use crate::config::Config;

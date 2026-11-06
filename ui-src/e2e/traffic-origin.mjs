@@ -52,7 +52,12 @@ function frames(socket, record, initial = Buffer.alloc(0)) {
   socket.on('data', consume);
   consume();
 }
-async function openClient() {
+function rawBytes(socket, record, initial = Buffer.alloc(0)) {
+  const capture = (bytes) => { if (bytes.length) record.push({ base64: bytes.toString('base64') }); };
+  capture(initial);
+  socket.on('data', capture);
+}
+async function openClient(kind = 'websocket') {
   client = track(net.connect(25198, '127.0.0.1'));
   const socket = client;
   await new Promise((resolve, reject) => {
@@ -60,14 +65,15 @@ async function openClient() {
     let pending = Buffer.alloc(0);
     const fail = () => { clearTimeout(timeout); reject(new Error('Upgrade closed')); };
     socket.once('close', fail);
-    socket.once('connect', () => socket.write('GET http://traffic.test/socket HTTP/1.1\r\nHost: traffic.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n'));
+    const wsHeaders = kind === 'websocket' ? 'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' : '';
+    socket.once('connect', () => socket.write(`GET http://traffic.test/socket HTTP/1.1\r\nHost: traffic.test\r\nConnection: Upgrade\r\nUpgrade: ${kind}\r\n${wsHeaders}\r\n`));
     function header(chunk) {
       pending = Buffer.concat([pending, chunk]);
       const end = pending.indexOf('\r\n\r\n');
       if (end < 0) return;
       clearTimeout(timeout); socket.off('close', fail); socket.off('data', header);
       if (!pending.toString().startsWith('HTTP/1.1 101')) { socket.destroy(); reject(new Error('Not upgraded')); return; }
-      frames(socket, fromServer, pending.subarray(end + 4));
+      (kind === 'raw' ? rawBytes : frames)(socket, fromServer, pending.subarray(end + 4));
       resolve();
     }
     socket.on('data', header);
@@ -83,13 +89,14 @@ const origin = http.createServer(async (req, res) => {
       client?.destroy(); serverPeer?.destroy();
       uploads = []; fromClient = []; fromServer = [];
       client = undefined; serverPeer = undefined;
-    } else if (req.url === '/ws/open') {
-      await openClient();
-    } else if (req.url === '/ws/client-send' || req.url === '/ws/server-send') {
+    } else if (req.url === '/ws/open' || req.url === '/tcp/open') {
+      await openClient(req.url === '/tcp/open' ? 'raw' : 'websocket');
+    } else if (['/ws/client-send', '/ws/server-send', '/tcp/client-send', '/tcp/server-send'].includes(req.url)) {
       const { base64, opcode = 2 } = JSON.parse(body);
-      const peer = req.url === '/ws/client-send' ? client : serverPeer;
+      const peer = req.url.endsWith('client-send') ? client : serverPeer;
       if (!peer || peer.destroyed) throw new Error('Peer not live');
-      peer.write(frame(opcode, Buffer.from(base64, 'base64'), peer === client));
+      const bytes = Buffer.from(base64, 'base64');
+      peer.write(req.url.startsWith('/tcp/') ? bytes : frame(opcode, bytes, peer === client));
     } else if (req.url?.startsWith('/upload')) {
       uploads.push({ base64: body.toString('base64'), headers: req.headers });
     } else if (req.url !== '/state') {
@@ -101,6 +108,11 @@ const origin = http.createServer(async (req, res) => {
 });
 origin.on('upgrade', (req, socket, head) => {
   serverPeer = track(socket);
+  if (req.headers.upgrade === 'raw') {
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: raw\r\nConnection: Upgrade\r\n\r\n');
+    rawBytes(socket, fromClient, head);
+    return;
+  }
   const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
   socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
   frames(socket, fromClient, head);

@@ -49,6 +49,12 @@ const PROSE = ['res.header.content-type', 'res.body'];
 const BUST = ['res.header.pragma', 'res.header.cache-control', 'res.header.expires', 'res.body'];
 
 const DECLARED = {
+  'tcp-controls-bench.js': [
+    ...['send: pause', 'receive: pause', 'paused script output'].map((name) =>
+      only(['2.10.8', '2.10.10'], name, ['answer'],
+        'upstream TCP emitData clears the held chunk before the resume callback, dropping it; '
+        + 'whix preserves paused bytes. Both sides independently verify a post-resume marker.')),
+  ],
   'cases-compose.js': [
     d('script ctx: getValue reads a fenced block', ['req.header.x-v'],
       'upstream\'s getValue misses a ``` block declared in the same text; this port serves it. Header, divergence 8'),

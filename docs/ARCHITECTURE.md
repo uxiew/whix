@@ -49,7 +49,7 @@ whix 是怎么搭起来的，各部分对应原版 whistle 源码的哪里，以
 | `src/proxy/script.rs`、`src/proxy/script_prelude.js` | `lib/rules/index.js`（`getScriptContext`、`execRulesScript`）、`lib/socket-mgr.js`（`execHandleFrame`） | JS 引擎（boa），以及脚本在里面能用到什么：规则脚本、在每条连接自己的线程上跑的 `frameScript`、PAC。prelude（预置脚本）是用 JavaScript 写的 Node `Buffer`、`url.parse`、`querystring.parse` 和 `iconv` 辅助函数 |
 | `src/proxy/pagelog.rs` | `lib/inspectors/log.js`、`assets/js/log.js` | `log://`：注入页面或脚本的采集器、它上报日志用的那个页面同源路径，以及 Console 面板读取的有界存储 |
 | `src/proxy/tls_options.rs` | `lib/rules/index.js`（`getTlsOptions`） | `tlsOptions://` 给源站连接配的客户端证书（PEM 或 PFX）和信任设置（`ca`、`rejectUnauthorized`）；也是连接池键的一部分 |
-| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket 帧编解码 + 会抓包的隧道：先跑 `frameScript`，再跑插件的帧钩子。另外还有 `inspected_relay`：`enable://inspect` 的隧道用的逐块转发 |
+| `src/proxy/ws.rs` | `lib/socket-mgr.js` | WebSocket 帧编解码 + 会抓包的隧道：先跑 `frameScript`，再跑插件的帧钩子。`ws/tcp.rs` 独立实现检查 TCP 的逐块转发与方向控制，保留 `ws::inspected_relay` 入口 |
 | `src/proxy/webui.rs`、`src/proxy/webui/` | `biz/webui` | 控制台：路由表（`webui.rs` 里的 `handle`）和它的 API，一个功能区一个文件——`access`、`sessions`、`har`、`rules`、`values`、`bundle`、`composer`、`console_hosts`、`plugin_pages`、`logs`（Console 面板的页面日志）、`switches`（HTTPS、全部规则、插件这几个开关） |
 | `ui-src/` | `biz/webui/htdocs` | 控制台前端：Vue 3 / Vite / TypeScript 应用，构建成单个文件，编译时内联进二进制；没构建时 `build.rs` 换上占位页，所以构建代理本身不需要 Node |
 | `ui-src/src/editor/whistle-classify.js` | — | 规则分类器；和解析器共用 `index_of_pattern`，有一个 Rust 测试保证两边一致 |
