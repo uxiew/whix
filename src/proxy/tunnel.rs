@@ -548,7 +548,7 @@ pub(super) struct Tunnel<'a> {
 /// thing. The direction modes are carried into the byte relay.
 pub(super) struct Inspect {
     flow: ws::FrameFlow,
-    script: Option<script::FrameScriptSpec>,
+    script: Option<FrameScriptSource>,
 }
 
 /// Whether the rules on this connection ask to inspect it, and with what.
@@ -707,7 +707,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut inspect = None;
-    let open = tunnel.and_then(|t| {
+    let mut open = tunnel.and_then(|t| {
         let (id, open) = t.state.record_open(Session {
             target: format!("{} (tunnel)", target_desc(target)),
             duration_ms: t.started.elapsed().as_millis(),
@@ -724,7 +724,13 @@ where
     let relayed = match inspect {
         // Chunk by chunk, each one a frame of this tunnel's session.
         Some((inspect, state, id)) => {
-            ws::inspected_relay_with_flow(client, origin, inspect.script, inspect.flow, state, id)
+            let script = load_frame_script(
+                inspect.script,
+                &state,
+                open.as_mut().map(|(_, session)| session),
+            )
+            .await;
+            ws::inspected_relay_with_flow(client, origin, script, inspect.flow, state, id)
                 .await
                 .map_err(Into::into)
         }

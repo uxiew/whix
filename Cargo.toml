@@ -19,6 +19,7 @@ include = [
     "/build.rs",
     "/examples/**",
     "/tests/*.rs",
+    "/tests/common/**",
     # What tests/data_compat.rs reads; the tests above would fail without it.
     "/tests/data/**",
     "/Cargo.toml",

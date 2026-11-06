@@ -1463,3 +1463,38 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 - 2.10.13：`target/remote-sources-oracle/final-1793971650466/`、`final-1793971651713/`；空源负例为 `final-1793971652888/`。启动器 `target/remote-sources-oracle/final-20261106.cjs`，指定 `RS_BIN` 为上述普通构建。归档保留 tarball、运行依赖和专项脚本哈希；旧审计产物未覆盖。
 
 **未验证／未纳入：** 未跑全部 31 个网络阶段、MSRV、跨平台、远端 CI、长期压力或真实外网服务。16 秒超时用真实回环 I/O 后的虚拟时钟验证，不是墙钟性能测量；HTTPS 成功场景只在隔离自签名夹具中显式启用 `--insecure-upstream`，默认拒绝该证书也有回归。远程 `frameScript`、CONNECT／WebSocket 升级响应规则和其他 JS 兼容差异另行处理，不宣称全量 2.10.13 对齐。没有修改真实代理数据、系统代理、证书信任库或依赖；只本地提交，不推送。
+
+
+## 2026-11-06 长连接远程脚本源
+
+**完成：** SCRIPT-02。远程 `frameScript` 接入转发的 WS/WSS、检查型 CONNECT（提前决定转发和首字节分流两条路径）、检查型原始 Upgrade。私有来源快照只保留选中的规则与请求上下文，在既有异步 relay 入口读取；复用 SCRIPT-01 的传输、16 秒期限、256 KiB 流式上限及失败诊断。未改帧处理管线、脚本引擎或公共类型，没有新增缓存、重试框架、依赖或锁文件变化。行为统一见[远程规则与脚本源](RULES.md#远程规则与脚本源)。
+
+**先建立运行证据：** 固定 2.10.13 的独立回环探针确认，源读取在握手后启动，每连接一次，首个数据等待源完成，不依赖首帧触发；普通 HTTP 和未检查的 CONNECT 不读取。旧 whix 的两条真实进程回归均失败：WS 源站收到 `a` 而非 `S1:a`，TCP 收到 `a\n` 而非 `S1:a\n`。修复不是把 URL 加进 HTTP 请求预加载器，也没有在 JS 工作线程中阻塞下载。
+
+**会话完整性：** WS 复用已有 `record_open` 生命周期，先显示握手行，等来源初始化结束才完成、落盘和调用观察者一次；这点已同步 API 与 `observe` 文档。TCP 保持连接结束时完成。晚到的诊断同时更新 owned session 与仍存在的缓存行；清屏／淘汰不重新插入，隐藏连接不产生诊断记录、帧或控制句柄。没有修改 Session 字段或引入历史补写、重复行及新的存储格式。
+
+| 验证 | 结果 |
+| --- | --- |
+| 新增真实进程回归 | 15/15：各传输入口、每连接读取／状态、慢源握手与上下文快照、4 个并发连接与配置读写、隐藏／清屏、诊断一次落盘及重启、文件／内联／Values、HTTPS 验证、重定向／超限／截断、分片／二进制／控制帧、初始化期间排队的关闭 |
+| `cargo test --locked --all-targets` | 1310 通过，12 项沿用忽略，无失败 |
+| `cargo test --locked --doc` | 2/2 |
+| `cargo fmt --all -- --check`、Clippy 全目标 `-D warnings` | 通过 |
+| 前端 `typecheck`／`build`、真实代理 Chrome 流量回归 | 通过；浏览器 8/8 |
+| 两个锁定版本的网络门禁 | 2.10.8／2.10.10 各 7/7：`cases-bodies` 182、`frames` 15、`ws` 6、`tcp-control` 7、`script-sources` 18、`frame-sources` 8、`core` 126；未知差异 0，未新增或扩大既有豁免 |
+| 两版快速门禁 | 各 5/5；规则问题 17462 + 2043，未知差异 0 |
+| 2.10.13 定向实测 | 永久 `frame-sources` 专项 8 个用例、16 项独立预期通过；新的隔离状态目录复放仍通过，不视作全量 2.10.13 基线验收 |
+| 独立预期负例 | 两边都返回空脚本时，效果相同、差异数 0，但 8 项预期失败并退出 1，不把“两边都没执行”算通过 |
+| 源码包清单、文档链接与 diff | 通过；`cargo package --list --allow-dirty --offline` 确认三份共用夹具在包内，未发布制品 |
+
+**测试设计：** 资源响应通过握手／数据提交的显式门闩放行，不以固定 sleep 判断完成，也不把不同 socket 的回调顺序当作线缆顺序。WS 单独验证计数状态；TCP 的批量断言使用分段无关变换，计数断言只输入不可再分的单字节。HTTP(S) 来源与独立帧编解码夹具分别提取到 `tests/common/http_source.rs`、`tests/common/frame_peer.rs`，旧来源／隐藏测试一并使用；补上源码包原来遗漏的 `tests/common/` 白名单，避免抽出夹具后源码包缺文件。文件名碰撞用例不使用 Windows 禁止的冒号字符。
+
+复放命令：Rust 使用 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`，单项为 `cargo test --locked --test remote_frames_e2e`；浏览器为 `PLAYWRIGHT_CHANNEL=chrome npm --prefix ui-src run test:e2e:traffic`。网络为 `node tests/differential/run.js network --only cases-bodies,frames,ws,tcp-control,script-sources,frame-sources,core`，第二版追加 `--whistle 2.10.10`；快速门禁用 `fast`。帧来源专项单独用 `--only frame-sources`。
+
+本地未入库证据：
+
+- Rust 红灯 `target/remote-frames-red-20261106.log`；最终 Rust／Clippy／文档测试为 `remote-frames-all-final-20261106.log`、`remote-frames-clippy-final-20261106.log`、`remote-frames-doc-final-20261106.log`；前端为 `remote-frames-ui-20261106.log`、`remote-frames-browser-20261106.log`；打包清单 `remote-frames-package-before-20261106.txt` 与 `remote-frames-package-20261106.txt`，均在 `target/`。
+- 网络：`target/differential/remote-frames-final-20261106-2.10.8/`、`remote-frames-final-20261106-2.10.10/`；快速门禁为同目录下的 `remote-frames-fast-20261106-2.10.8/`、`remote-frames-fast-20261106-2.10.10/`。
+- 2.10.13 前置探针：`target/remote-frame-oracle/run-1793973233058/results.json`；最终专项：`final-1793975263138/`、`final-1793975264017/`；空源负例：`final-1793975264854/`。启动器 `target/remote-frame-oracle/final-20261106.cjs`，所有 HOME、WHISTLE_PATH 与来源／源站均隔离；旧审计产物未覆盖。
+- 普通构建、浏览器与最终差分使用的二进制 SHA-256：`0e7f729cebbf2ae04f2cb5b302968265d5997784f738dbf32eda13d8a0a8cca4`。
+
+**未纳入／未验证：** 不包括 `ctx.destroy` 等 JS 语义、`statusCode://101` 本地模拟 WS 或升级响应规则。未跑全部 32 个网络阶段、MSRV、跨平台、远端 CI、长期压力、真实外网来源或源码包的完整构建验证；HTTPS 成功用例仅在隔离自签名夹具显式启用 `--insecure-upstream`，默认拒绝也有回归。没有修改真实代理数据、系统代理或证书信任库；只本地提交，不推送。

@@ -3,6 +3,9 @@
 //! environment variable. Each test file uses some of these, hence the allow.
 #![allow(dead_code)]
 
+pub mod frame_peer;
+pub mod http_source;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

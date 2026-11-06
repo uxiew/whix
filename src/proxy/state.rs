@@ -213,8 +213,9 @@ impl AppState {
     /// A forwarded response is in the console from the moment its head
     /// arrives, and reaches this callback only when its body ends; a stream
     /// that never ends is never delivered. A WebSocket is over, for this
-    /// purpose, once its handshake is: the frames that follow are not part of
-    /// the session.
+    /// purpose, once its handshake and frame-script source initialization are
+    /// done, so source failures are included. The frames that follow are not
+    /// part of the session.
     ///
     /// Settable once, before serving. A second call is ignored rather than
     /// replacing the first, so a library consumer cannot silently lose the
@@ -310,6 +311,21 @@ impl AppState {
             q.push_back(session);
         }
         (ids, count.min(cap), (before + count).saturating_sub(cap))
+    }
+
+    /// Annotate an owned in-flight session and its visible copy. Clearing or
+    /// evicting the row must not resurrect it; the owner still persists once.
+    pub(super) fn note_unapplied(&self, session: &mut Session, note: unapplied::Unapplied) {
+        if let Some(visible) = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|s| s.id == session.id)
+        {
+            visible.unapplied.push(note.clone());
+        }
+        session.unapplied.push(note);
     }
 
     /// Hand a finished transaction to the observer and to the history on disk.

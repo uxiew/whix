@@ -53,7 +53,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:8899/api/replay -d '{"id": 999999
 
 这几条读接口其实不看方法，用 GET 就行。
 
-**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外这些字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`imported: true`（HAR 离线导入）、`open: true`（响应还在传，见下文）、`unapplied`（有命中的规则没生效，见[没生效的规则](#没生效的规则)）。
+**列表行上有什么：** `id`、`time_ms`、`method`、`url`、`status`、`client_ip`、`target`、`duration_ms`、`log`、`rules`、`up`/`down`（body 字节数，不含头）、`has_req_body`/`has_res_body`/`has_frames`、`type`（响应的 `content-type`）。另外这些字段只在成立时出现：`error`（没完成，见下文）、`composer: true`（Composer 或 Replay 发的）、`imported: true`（HAR 离线导入）、`open: true`（响应还在传或帧脚本源正在初始化，见下文）、`unapplied`（有命中的规则没生效，见[没生效的规则](#没生效的规则)）。
 
 **当游标轮询：** 列表永远是整个内存里的会话（上限 `-R`，最少 600 条）。程序要持续跟踪时：
 
@@ -133,7 +133,7 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 - 响应头一到就出现在列表里，这时 body 可能还在传。本地应答的、失败的，出现时就已完成。
 - body 传完、出错或客户端中途离开，才算完成。**完成时才写进磁盘历史，嵌入 API 的 `on_session` 也在这时调用**，每条只调一次。所以历史里存的是完整的 body 预览和全部耗时阶段；中途断掉的会在这时补上 `response` 或 `client`。
 - 一直不结束的流（长连着的 SSE）结束前不会写盘；代理进程被直接杀掉时，这类还开着的会话不会进历史。
-- WebSocket 握手完成就算完成，之后的帧另外记（`/frames.json`），不属于会话本身。
+- WebSocket 通常在握手结束时完成；配置 `frameScript` 时，先显示为 `open`，等脚本源初始化结束再完成，这样来源失败也能一次性写入历史并传给 `on_session`。之后的帧另外记（`/frames.json`），不属于会话本身。
 
 **各入口的范围：**
 
@@ -175,7 +175,7 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上；或 `tlsOptions://` 里有本代理的 TLS 库做不了的选项（`dhparam`、`secureOptions` 等） | 不带那一部分建连（版本限制和其余选项保留） |
 | `missing-value` | 改 body 的算子（`resBody`、`resPrepend`、`htmlAppend`、`reqBody` 等）整个值是 `{名字}`，而规则文本的 ``` 块和 Values 里都没有这个名字 | 不执行，body 和缓存头都不动；`reason` 里写着是哪个名字 |
 | `script-failed` | 规则跑的脚本（`reqScript`、`rulesFile`、`resScript` 等）抛了错，或 1 秒还没跑完；`reason` 写明是哪种，抛错时带上错误信息 | 脚本推的规则、对响应的改动都不算数，请求照常继续 |
-| `rule-source-failed` | 远程 `reqScript`／`reqRules`／`resScript`／`resRules` 来源未完整加载（非 200、传输失败、超时或超限）；`reason` 不包含源 URL，`ops` 仍保留原规则 | 不执行部分内容，请求照常继续；具体读取边界见[远程规则与脚本源](RULES.md#远程规则与脚本源) |
+| `rule-source-failed` | 远程 `reqScript`／`reqRules`／`resScript`／`resRules`／`frameScript` 来源未完整加载（非 200、传输失败、超时或超限）；`reason` 不包含源 URL，`ops` 仍保留原规则 | 不执行部分内容，请求照常继续；具体读取边界见[远程规则与脚本源](RULES.md#远程规则与脚本源) |
 
 `rule-source-failed` 是新增的 `kind` 值；使用固定白名单的 API 调用方需一并支持。历史回退边界见[升级与降级](INSTALL.md#升级)。
 

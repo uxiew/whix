@@ -122,6 +122,14 @@ impl Ledger {
         self.state.record(session)
     }
 
+    /// Show a session whose asynchronous initialization or response is still
+    /// running. Its owner completes it once, including any later diagnostics.
+    pub(super) fn record_open(&mut self, mut session: Session) -> (u64, Option<Session>) {
+        self.settled = true;
+        self.stamp(&mut session);
+        self.state.record_open(session)
+    }
+
     /// Record `session` as this request's one session, its response `body`
     /// still to come: it is completed when the body is over, and fails then
     /// if the body breaks off or the client leaves before the end. `expected`
@@ -129,13 +137,11 @@ impl Ledger {
     /// [`outcome::settle`].
     pub(super) fn record_streaming(
         &mut self,
-        mut session: Session,
+        session: Session,
         body: DynBody,
         expected: Option<u64>,
     ) -> (u64, DynBody) {
-        self.settled = true;
-        self.stamp(&mut session);
-        let (id, open) = self.state.record_open(session);
+        let (id, open) = self.record_open(session);
         let Some(session) = open else {
             return (id, body);
         };

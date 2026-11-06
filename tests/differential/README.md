@@ -88,6 +88,17 @@ node run.js network --only script-sources --whistle 2.10.10
 
 重复 `resRules` URL 的读取次数有意不同：whix 每阶段共用一个快照，上游读取两次。两种次数都单独断言，归档的 `fetchPolicyDifferences` 明列该差异；这里只对照静态内容，不宣称动态源等价。其它源读取边界由 Rust 单元和真实进程回归覆盖，见[规则说明](../../docs/RULES.md#远程规则与脚本源)。
 
+## 远程帧脚本源
+
+```sh
+node run.js network --only frame-sources
+node run.js network --only frame-sources --whistle 2.10.10
+```
+
+`frame-sources-bench.js` 复用标准代理对，另用 `PORT_BASE+2/+3/+4` 提供 WS／HTTP 源站、脚本源和 TCP 对端。8 个用例、每边 8 项独立预期覆盖 WS 状态与每连接读取、inspect CONNECT、未使用的来源、404 有效脚本体不得执行。资源响应必须等客户端收到握手并提交首个数据后才释放，源站在源读取结束前不能收到数据；用这个因果约束验证初始化，而不是固定等待一段时间或要求不同 socket 的回调严格排序。事件序列和读取次数仍保存在报告中。
+
+两方向使用相同的改写，避免把 2.10.8 的已知 WS 方向缺陷算成本项差异；WS 检查跨帧状态，TCP 用不受分段影响的逐字符变换和拼接字节判定。即使两个代理结果相同，任何一边违反固定预期也会退出 1。WSS、HTTPS 来源、边界与可见性等另由 Rust 真实进程回归验证。
+
 ## 上游自带的测试
 
 ```sh

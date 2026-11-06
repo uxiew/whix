@@ -84,19 +84,44 @@ pub(super) fn is_websocket(req: &Request<DynBody>, resolved: &Resolved) -> bool 
         .unwrap_or(false)
 }
 
-/// The `frameScript://` a connection's rules name, read and ready to start —
-/// or `None` when there is none, or its text never says `ctx`.
-///
-/// The script sees the request the way a `reqScript` does, so it is built here,
-/// where the request is known, and started later, inside the tunnel.
+/// A connection's selected source and context, snapshotted before replying.
+/// Loading is separate: remote frame scripts must not delay the handshake.
+pub(super) struct FrameScriptSource {
+    op: crate::rules::RuleOp,
+    info: ReqInfo,
+    values: HashMap<String, String>,
+}
+
 pub(super) fn frame_script_of(
     state: &AppState,
     info: &ReqInfo,
     resolved: &Resolved,
+) -> Option<FrameScriptSource> {
+    Some(FrameScriptSource {
+        op: resolved.get("frameScript")?.clone(),
+        info: info.clone(),
+        values: effective_values(state),
+    })
+}
+
+/// Resolve the source after 101/200, before either direction starts pumping.
+/// The same bounded loader serves HTTP scripts and these connection scripts.
+pub(super) async fn load_frame_script(
+    source: Option<FrameScriptSource>,
+    state: &AppState,
+    session: Option<&mut Session>,
 ) -> Option<script::FrameScriptSpec> {
-    let op = resolved.get("frameScript")?;
-    let src = script::load_script(&op.value)?;
-    script::FrameScriptSpec::for_request(src, info, &op.raw_pattern, &effective_values(state))
+    let source = source?;
+    let text = match apply::read_frame_script_source(&source.op).await {
+        Ok(text) => text?,
+        Err(note) => {
+            if let Some(session) = session {
+                state.note_unapplied(session, note);
+            }
+            return None;
+        }
+    };
+    script::FrameScriptSpec::for_request(text, &source.info, &source.op.raw_pattern, &source.values)
 }
 
 /// Forward an upgrade handshake and, on `101`, tunnel bytes both ways.
@@ -126,7 +151,6 @@ pub(super) async fn serve_upgrade(
         .map_err(outcome::at(outcome::Phase::Rules))?;
     ledger.note(|s| s.target = target_desc(&target));
     note_cipher_dropped(ledger, &target, resolved);
-    let frame_script = frame_script_of(state, info, resolved);
     let websocket = is_websocket(&req, resolved);
     // Snapshot capture visibility and candidate hooks from the same rules.
     // Plugins are contacted later, from inside the tunnel.
@@ -141,6 +165,9 @@ pub(super) async fn serve_upgrade(
     // An upgrade to something other than WebSocket is relayed as bytes, and
     // `enable://inspect` asks for those to be shown — see `ws::inspected_relay`.
     let inspected = !websocket && inspects(resolved);
+    let frame_script = (websocket || inspected)
+        .then(|| frame_script_of(state, info, resolved))
+        .flatten();
     let client_upgrade = hyper::upgrade::on(&mut req);
 
     // Build the upstream handshake request (upgrades carry no body, so
@@ -219,7 +246,7 @@ pub(super) async fn serve_upgrade(
         return Err(Destroyed.into());
     }
 
-    let session_id = ledger.record(Session {
+    let session = Session {
         id: 0,
         time_ms,
         method: info.method.clone(),
@@ -233,13 +260,22 @@ pub(super) async fn serve_upgrade(
         res_headers: header_pairs(resp.headers()),
         timings: Some(timings),
         ..Default::default()
-    });
+    };
 
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        // Upstream declined the upgrade; relay its response verbatim.
+        // Upstream declined the upgrade; no frame source is consumed.
+        ledger.record(session);
         let (p, b) = resp.into_parts();
         return Ok(Response::from_parts(p, body::from_incoming(b)));
     }
+
+    // Keep the row visible while its source loads, but persist only once the
+    // initialization result is known. No late history rewrite or duplicate row.
+    let (session_id, mut session) = if frame_script.is_some() {
+        ledger.record_open(session)
+    } else {
+        (ledger.record(session), None)
+    };
 
     // A hidden upgrade still runs rules/scripts, but its allocated id must not
     // expose captures or controls. Derive visibility from rules, not the cache.
@@ -253,6 +289,10 @@ pub(super) async fn serve_upgrade(
             Ok((client_io, upstream_io)) => {
                 let c = TokioIo::new(client_io);
                 let u = TokioIo::new(upstream_io);
+                let frame_script = load_frame_script(frame_script, &state, session.as_mut()).await;
+                if let Some(session) = &session {
+                    state.complete(session);
+                }
                 if websocket {
                     // Frame-aware tunnel: capture every frame, run the script on
                     // text frames when a frameScript rule matched, and offer each
@@ -291,7 +331,12 @@ pub(super) async fn serve_upgrade(
                     }
                 }
             }
-            Err(err) => tracing::debug!("upgrade failed: {err}"),
+            Err(err) => {
+                if let Some(session) = &session {
+                    state.complete(session);
+                }
+                tracing::debug!("upgrade failed: {err}");
+            }
         }
     });
 

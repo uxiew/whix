@@ -1,66 +1,14 @@
 //! WS/WSS visibility from real peers and the public APIs, without UI filtering.
 mod common;
 
+use common::frame_peer::{Peer, close, expect, headers, send};
 use common::{Instance, get, request, scratch, start};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-trait Io: Read + Write {}
-impl<T: Read + Write> Io for T {}
-type Peer = Box<dyn Io + Send>;
-
-fn headers(peer: &mut dyn Io) -> Vec<u8> {
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        peer.read_exact(&mut byte).unwrap();
-        head.push(byte[0]);
-    }
-    head
-}
-
-// Independent small-frame codec: the fixture only sends payloads under 126 bytes.
-fn send(peer: &mut dyn Io, fin: bool, opcode: u8, payload: &[u8], masked: bool) {
-    assert!(payload.len() < 126);
-    let mut frame = vec![
-        (if fin { 0x80 } else { 0 }) | opcode,
-        payload.len() as u8 | if masked { 0x80 } else { 0 },
-    ];
-    if masked {
-        let key = [1, 2, 3, 4];
-        frame.extend_from_slice(&key);
-        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
-    } else {
-        frame.extend_from_slice(payload);
-    }
-    peer.write_all(&frame).unwrap();
-    peer.flush().unwrap();
-}
-
-fn expect(peer: &mut dyn Io, opcode: u8, payload: &[u8], masked: bool) {
-    let mut head = [0; 2];
-    peer.read_exact(&mut head).unwrap();
-    assert_eq!(head[0], 0x80 | opcode);
-    assert_eq!(head[1] & 0x80 != 0, masked);
-    let length = (head[1] & 0x7f) as usize;
-    assert!(length < 126);
-    let mut key = [0; 4];
-    if masked {
-        peer.read_exact(&mut key).unwrap();
-    }
-    let mut actual = vec![0; length];
-    peer.read_exact(&mut actual).unwrap();
-    if masked {
-        for (i, b) in actual.iter_mut().enumerate() {
-            *b ^= key[i % 4];
-        }
-    }
-    assert_eq!(actual, payload);
-}
 
 fn status(proxy: &Instance) -> Value {
     serde_json::from_slice(&get(&proxy.addr, "/api/ws/status?id=1").1).unwrap()
@@ -114,7 +62,7 @@ fn open(dir: &Path, tls: bool, flags: &str, script: Option<&str>) -> (Instance, 
             )),
             None => Box::new(socket),
         };
-        assert!(headers(&mut *peer).starts_with(b"GET /socket HTTP/1.1"));
+        assert!(headers(&mut *peer).starts_with("GET /socket HTTP/1.1"));
         peer.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n").unwrap();
         peer.flush().unwrap();
         peer
@@ -141,7 +89,7 @@ fn open(dir: &Path, tls: bool, flags: &str, script: Option<&str>) -> (Instance, 
             "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
         )
         .unwrap();
-        assert!(headers(&mut socket).starts_with(b"HTTP/1.1 200"));
+        assert!(headers(&mut socket).starts_with("HTTP/1.1 200"));
         let pem = get(&proxy.addr, "/rootCA.crt").1;
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
@@ -164,16 +112,8 @@ fn open(dir: &Path, tls: bool, flags: &str, script: Option<&str>) -> (Instance, 
     };
     write!(client, "GET {target} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
     client.flush().unwrap();
-    assert!(headers(&mut *client).starts_with(b"HTTP/1.1 101"));
+    assert!(headers(&mut *client).starts_with("HTTP/1.1 101"));
     (proxy, client, origin.join().unwrap())
-}
-
-fn close(client: &mut dyn Io, origin: &mut dyn Io) {
-    let code = 1000_u16.to_be_bytes();
-    send(client, true, 8, &code, true);
-    expect(origin, 8, &code, true);
-    send(origin, true, 8, &code, false);
-    expect(client, 8, &code, false);
 }
 
 fn assert_hidden(proxy: &Instance) {

@@ -299,6 +299,32 @@ async fn read_url_value(url: &str) -> Result<Loaded, String> {
     }
 }
 
+/// Frame sources are consumed once after the connection handshake. Explicit
+/// content must not be reopened as a path; the bare-inline fallback is the
+/// existing frameScript spelling, unlike the rule-producing script families.
+pub(in crate::proxy) async fn read_frame_script_source(
+    op: &RuleOp,
+) -> Result<Option<String>, crate::proxy::unapplied::Unapplied> {
+    if op.value_is_content {
+        return Ok(Some(op.value.clone()));
+    }
+    if is_http_url(op.value.trim()) {
+        return read_url_value(op.value.trim())
+            .await
+            .map(|source| Some(source.text))
+            .map_err(|reason| source_failure(op, &reason));
+    }
+    Ok(crate::proxy::script::load_script(&op.value))
+}
+
+fn source_failure(op: &RuleOp, reason: &str) -> crate::proxy::unapplied::Unapplied {
+    crate::proxy::unapplied::Unapplied {
+        kind: crate::proxy::unapplied::Kind::RuleSourceFailed,
+        ops: vec![op.raw.clone()],
+        reason: format!("{reason}; rule/script source was not executed"),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::proxy) enum ScriptPhase {
     Request,
@@ -346,11 +372,7 @@ pub(in crate::proxy) async fn load_remote_scripts(
                 // (or a partial response body) as code or as a local filename.
                 op.value.clear();
                 if let Ok(mut noted) = at.noted.lock() {
-                    noted.push(crate::proxy::unapplied::Unapplied {
-                        kind: crate::proxy::unapplied::Kind::RuleSourceFailed,
-                        ops: vec![op.raw.clone()],
-                        reason: format!("{reason}; rule/script source was not executed"),
-                    });
+                    noted.push(source_failure(op, reason));
                 }
             }
         }

@@ -1172,7 +1172,7 @@ pinned.example.com   sniCallback://no-mitm
 | 算子 | 值 | 作用 |
 |----------|-------|--------|
 | `resScript` | `.js` 文件路径、HTTP(S) URL、`{value}` 或内联 JS | 对响应执行 JavaScript |
-| `frameScript` | `.js` 文件路径、`{value}` 或内联 JS | 对每个 WebSocket 帧执行 JavaScript——配合 `enable://inspect` 时，也对普通隧道的每个数据块执行 |
+| `frameScript` | `.js` 文件路径、HTTP(S) URL、`{value}` 或内联 JS | 对每个 WebSocket 帧执行 JavaScript——配合 `enable://inspect` 时，也对普通隧道的每个数据块执行 |
 
 脚本在一个内嵌的 JS 引擎里运行，有一个全局变量 `ctx`：
 
@@ -1400,19 +1400,22 @@ if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
 
 #### 远程规则与脚本源
 
-`reqScript`、`reqRules`、`resScript`、`resRules` 可以直接读取 HTTP(S) URL，和各自的文件／Values 内容走同一条执行路径；`rulesFile` 的其他别名也适用。官网的 [reqScript](https://wproxy.org/docs/rules/reqScript.html)、[resScript](https://wproxy.org/docs/rules/resScript.html)、[reqRules](https://wproxy.org/docs/rules/reqRules.html)、[resRules](https://wproxy.org/docs/rules/resRules.html) 都列出了远程 URL 形式：
+`reqScript`、`reqRules`、`resScript`、`resRules`、`frameScript` 可以直接读取 HTTP(S) URL，和各自的文件／Values 内容走同一条执行路径；`rulesFile` 的其他别名也适用。官网的 [reqScript](https://wproxy.org/docs/rules/reqScript.html)、[resScript](https://wproxy.org/docs/rules/resScript.html)、[reqRules](https://wproxy.org/docs/rules/reqRules.html)、[resRules](https://wproxy.org/docs/rules/resRules.html)、[frameScript](https://wproxy.org/docs/rules/frameScript.html) 都列出了远程 URL 形式：
 
 ```text
 example.com reqScript://https://rules.example.test/request.js
 example.com resRules://https://rules.example.test/response.rules
+chat.example.com frameScript://https://rules.example.test/frame.js
 ```
 
-- **时机：** 请求源在转发前下载并执行；响应源在收到响应头后下载并执行。外层规则的选择和 URL 模板展开仍发生在请求阶段：不要把 `includeFilter://s:201` 写在外层 `resRules`／`resScript` 行上，应写进下载或生成的规则里。固定 2.10.13 的实际行为也是如此；响应脚本内部仍能读取 `statusCode`、`resHeaders`。
-- **读取次数：** 只读取最终选中的条目（所有纯规则条目、第一条脚本）。每个请求、每个阶段中，相同 URL 共用一次下载结果，不跨请求缓存；一次失败不会切换到第二条脚本，也不会在同一阶段重试。上游重复 `resRules` URL 会读取多次，因此只保证静态源的效果对照，不保证每次返回不同内容的动态源语义相同。
-- **预算与失败：** 沿用远程值的整次读取 16 秒期限、256 KiB 内容上限；超限在读取过程中停止，不先无限缓冲。只执行完整的 HTTP 200 内容；非 200、截断、传输错误或超时均不执行任何部分，不跟随重定向。会话记录 `unapplied.kind = rule-source-failed`；下一次请求重新读取。上游的 16 秒是空闲超时，这里的整次期限更严格，也不自动重试传输错误。
+- **请求／响应源：** 请求源在转发前下载并执行；响应源在收到响应头后下载并执行。外层规则的选择和 URL 模板展开仍发生在请求阶段：不要把 `includeFilter://s:201` 写在外层 `resRules`／`resScript` 行上，应写进下载或生成的规则里。固定 2.10.13 的实际行为也是如此；响应脚本内部仍能读取 `statusCode`、`resHeaders`。
+- **请求／响应源的读取次数：** 只读取最终选中的条目（所有纯规则条目、第一条脚本）。每个请求、每个阶段中，相同 URL 共用一次下载结果，不跨请求缓存；一次失败不会切换到第二条脚本，也不会在同一阶段重试。上游重复 `resRules` URL 会读取多次，因此只保证静态源的效果对照，不保证每次返回不同内容的动态源语义相同。
+- **帧脚本源：** 转发的 WS/WSS、启用 `inspect` 的 CONNECT（包括读入首字节后才决定转发的路径）和原始 Upgrade，在 `101/200` 握手后读取当前连接选中的一个源，再启动既有脚本／帧管线。无需首帧触发，但双向数据要等源读取结束；不阻塞握手或控制台配置操作。每条新连接重新读取，同一连接不重读、不热更新；选中规则、Values 上下文和可见性保持建立连接时的快照。普通 HTTP、不检查的隧道／Upgrade、被源站拒绝的升级不会读取。
+- **帧源诊断：** 加载失败后原样转发，不执行错误响应或截断内容，仍记录 `rule-source-failed`。WS 在源初始化结束后完成会话并落盘一次，TCP 沿用连接结束时落盘；初始化期间的帧控制尚不可用。清屏或淘汰不会被晚到的失败重新插入列表；隐藏连接仍加载、执行，但不暴露会话、帧或控制句柄。
+- **预算与失败：** 沿用远程值的整次读取 16 秒期限、256 KiB 内容上限；超限在读取过程中停止，不先无限缓冲。只执行完整的 HTTP 200 内容；非 200、截断、传输错误或超时均不执行任何部分，不跟随重定向。会话记录 `unapplied.kind = rule-source-failed`；下一次请求或连接重新读取。上游的 16 秒是空闲超时，这里的整次期限更严格，也不自动重试传输错误。
 - **传输：** 使用现有上游 TLS 验证策略；不继承被代理请求的 Cookie／Authorization，`Host` 保留源 URL 的端口。`{value}`／内联内容不会被再次当作 URL 或文件名读取。
 
-这部分只覆盖 HTTP 请求／响应路径；远程 `frameScript`、CONNECT／WebSocket 升级的响应规则及其他 JavaScript 兼容差异仍未补齐。
+CONNECT／WebSocket 升级的响应规则及其他 JavaScript 兼容差异仍未补齐；`statusCode://101` 本地模拟的空连接也仍未接入帧脚本。这次只补来源读取，不改变已有脚本能力。
 
 ### `log://` —— 页面的控制台，搬到这里
 
