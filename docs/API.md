@@ -175,6 +175,9 @@ Capture filter 在浏览器里、对新到的行生效，存在浏览器的 `loc
 | `cipher-unusable` | `cipher://` 选不出可用的套件，或套件和允许的 TLS 版本对不上；或 `tlsOptions://` 里有本代理的 TLS 库做不了的选项（`dhparam`、`secureOptions` 等） | 不带那一部分建连（版本限制和其余选项保留） |
 | `missing-value` | 改 body 的算子（`resBody`、`resPrepend`、`htmlAppend`、`reqBody` 等）整个值是 `{名字}`，而规则文本的 ``` 块和 Values 里都没有这个名字 | 不执行，body 和缓存头都不动；`reason` 里写着是哪个名字 |
 | `script-failed` | 规则跑的脚本（`reqScript`、`rulesFile`、`resScript` 等）抛了错，或 1 秒还没跑完；`reason` 写明是哪种，抛错时带上错误信息 | 脚本推的规则、对响应的改动都不算数，请求照常继续 |
+| `rule-source-failed` | 远程 `reqScript`／`reqRules`／`resScript`／`resRules` 来源未完整加载（非 200、传输失败、超时或超限）；`reason` 不包含源 URL，`ops` 仍保留原规则 | 不执行部分内容，请求照常继续；具体读取边界见[远程规则与脚本源](RULES.md#远程规则与脚本源) |
+
+`rule-source-failed` 是新增的 `kind` 值；使用固定白名单的 API 调用方需一并支持。历史回退边界见[升级与降级](INSTALL.md#升级)。
 
 这些都是**降级**：请求照常完成，只是这些算子没执行。只有插件的认证网关（auth）失败时会拦截请求，那是请求失败，记在 `error` 里（阶段 `plugin`），不在这里。控制台的 Rules 标签页会把这些算子划掉并标 "not applied"。
 

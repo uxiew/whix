@@ -2102,13 +2102,19 @@ async fn socks5_connect(
 /// Fetch a URL with a simple GET and return `(status, body)`. Used by
 /// `responseFor` to prefetch another request's response.
 pub async fn simple_get(url: &str) -> Result<(u16, Bytes)> {
-    simple_request("GET", url, None).await
+    simple_request("GET", url, None, None).await
+}
+
+/// GET with a body limit enforced while reading, not after collecting it.
+/// URL-valued rules must not buffer an unbounded response before rejecting it.
+pub(crate) async fn simple_get_limited(url: &str, limit: usize) -> Result<(u16, Bytes)> {
+    simple_request("GET", url, None, Some(limit)).await
 }
 
 /// POST a JSON body to a URL and return `(status, body)`. Used by the plugin
 /// runtime to dispatch to remote (Node/HTTP) plugins.
 pub async fn simple_post_json(url: &str, json: &str) -> Result<(u16, Bytes)> {
-    simple_request("POST", url, Some(json)).await
+    simple_request("POST", url, Some(json), None).await
 }
 
 /// Split an absolute URL into a direct [`Target`] and its origin-form path.
@@ -2116,9 +2122,18 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow!("bad url {url}"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // A URL can have a query without an explicit path. Fragments are client
+    // metadata, never part of the HTTP request target or DNS name.
+    let rest = rest.split_once('#').map_or(rest, |(rest, _)| rest);
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        bail!("URL has no authority");
+    }
+    let path = match &rest[end..] {
+        "" => "/".to_string(),
+        query if query.starts_with('?') => format!("/{query}"),
+        path => path.to_string(),
     };
     let tls = scheme.eq_ignore_ascii_case("https");
     let (host, port) = split_host_port(authority, if tls { 443 } else { 80 });
@@ -2140,19 +2155,28 @@ fn parse_absolute_url(url: &str) -> Result<(Target, String)> {
         auto2http: false,
         h2: None,
     };
-    Ok((target, path.to_string()))
+    Ok((target, path))
 }
 
 /// One-shot HTTP request to an absolute URL, returning `(status, body)`.
 ///
 /// Deliberately minimal: no pooling, no redirects, no retries — the plugin
 /// runtime layers its own retry policy on top, and plugin endpoints are local.
-async fn simple_request(method: &str, url: &str, json: Option<&str>) -> Result<(u16, Bytes)> {
+async fn simple_request(
+    method: &str,
+    url: &str,
+    json: Option<&str>,
+    limit: Option<usize>,
+) -> Result<(u16, Bytes)> {
     let (target, path) = parse_absolute_url(url)?;
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", &target.sni);
+    let mut builder = Request::builder().method(method).uri(path).header(
+        "host",
+        join_host_port(
+            &target.sni,
+            target.request_port,
+            if target.tls { 443 } else { 80 },
+        ),
+    );
     if json.is_some() {
         builder = builder.header("content-type", "application/json");
     }
@@ -2164,7 +2188,21 @@ async fn simple_request(method: &str, url: &str, json: Option<&str>) -> Result<(
         .context("building plugin request")?;
     let resp = forward(&target, req).await?;
     let status = resp.status().as_u16();
-    let bytes = resp.into_body().collect().await?.to_bytes();
+    let bytes = match limit {
+        Some(limit) => http_body_util::Limited::new(resp.into_body(), limit)
+            .collect()
+            .await
+            // Keep the standard limit error downcastable across the boxed
+            // Body error boundary, so callers can distinguish it from I/O.
+            .map_err(
+                |error| match error.downcast::<http_body_util::LengthLimitError>() {
+                    Ok(limit) => anyhow::Error::new(*limit),
+                    Err(error) => anyhow::Error::from_boxed(error),
+                },
+            )?
+            .to_bytes(),
+        None => resp.into_body().collect().await?.to_bytes(),
+    };
     Ok((status, bytes))
 }
 
@@ -3462,3 +3500,39 @@ mod h2_tests;
 #[cfg(test)]
 #[path = "mtls_tests.rs"]
 mod mtls_tests;
+
+#[cfg(test)]
+mod one_shot_url_tests {
+    use super::*;
+
+    #[test]
+    fn query_only_urls_and_fragments_do_not_become_dns_names_or_ports() {
+        for (url, host, port, path) in [
+            (
+                "http://127.0.0.1:9001?v=1#local",
+                "127.0.0.1",
+                9001,
+                "/?v=1",
+            ),
+            ("https://[::1]:9002?v=2", "::1", 9002, "/?v=2"),
+            ("http://example.test#local", "example.test", 80, "/"),
+            (
+                "https://example.test/file?q=1#local",
+                "example.test",
+                443,
+                "/file?q=1",
+            ),
+        ] {
+            let (target, actual) = parse_absolute_url(url).unwrap();
+            assert_eq!(
+                (
+                    target.connect_host.as_str(),
+                    target.connect_port,
+                    actual.as_str()
+                ),
+                (host, port, path)
+            );
+        }
+        assert!(parse_absolute_url("http://?v=1").is_err());
+    }
+}

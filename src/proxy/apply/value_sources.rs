@@ -210,11 +210,7 @@ pub(super) const VALUE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration:
 /// The most a URL-valued operator may contribute (`MAX_URL_VAL_LEN`,
 /// `_original/lib/plugins/index.js:1497`).
 ///
-/// Upstream enforces it *while* reading and aborts the response; this port asks
-/// the shared one-shot helper for the whole body and then rejects an oversized
-/// one, because [`super::super::upstream::simple_get`] collects before it returns and
-/// growing a second, capped variant of it is not this change's business. The
-/// deadline above is what bounds the exchange in the meantime.
+/// Enforced while reading: an oversized source is never executed in part.
 pub(super) const MAX_URL_VALUE: usize = 256 * 1024;
 
 /// Read the content an operator's value points at.
@@ -269,31 +265,96 @@ pub(super) async fn read_value_source(source: &ValueSource) -> Option<Loaded> {
                 raw: Some(Bytes::from(parts.join(CRLF))),
             })
         }
-        ValueSource::Url(url) => {
-            let fetch = super::super::upstream::simple_get(url);
-            match tokio::time::timeout(VALUE_FETCH_TIMEOUT, fetch).await {
-                Ok(Ok((200, bytes))) if bytes.len() <= MAX_URL_VALUE => Some(Loaded {
-                    text: String::from_utf8_lossy(&bytes).into_owned(),
-                    raw: Some(Bytes::copy_from_slice(&bytes)),
-                }),
-                Ok(Ok((200, bytes))) => {
-                    tracing::warn!("rule value {url}: {} bytes exceeds the limit", bytes.len());
-                    None
-                }
-                Ok(Ok((status, _))) => {
-                    tracing::warn!("rule value {url}: responded {status}");
-                    None
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!("rule value {url}: {err}");
-                    None
-                }
-                Err(_) => {
-                    tracing::warn!("rule value {url}: timed out");
-                    None
+        ValueSource::Url(url) => read_url_value(url)
+            .await
+            .map_err(|reason| {
+                tracing::warn!(
+                    "rule value {}: {reason}",
+                    super::super::ledger::without_query(url)
+                );
+            })
+            .ok(),
+    }
+}
+
+/// Shared transport and bounds for remote values and rule/script sources.
+async fn read_url_value(url: &str) -> Result<Loaded, String> {
+    let fetch = super::super::upstream::simple_get_limited(url, MAX_URL_VALUE);
+    match tokio::time::timeout(VALUE_FETCH_TIMEOUT, fetch).await {
+        Ok(Ok((200, bytes))) => Ok(Loaded {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            raw: Some(bytes),
+        }),
+        Ok(Ok((status, _))) => Err(format!("remote source returned HTTP {status}")),
+        Ok(Err(error)) if error.root_cause().is::<http_body_util::LengthLimitError>() => {
+            Err(format!("remote source exceeds {MAX_URL_VALUE} bytes"))
+        }
+        // Do not copy transport error strings that can contain URL credentials
+        // into the default log or the structured failure reason.
+        Ok(Err(_)) => Err("remote source transport failed".into()),
+        Err(_) => Err(format!(
+            "remote source timed out after {} seconds",
+            VALUE_FETCH_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::proxy) enum ScriptPhase {
+    Request,
+    Response,
+}
+
+/// Materialize only entries this phase will consume. Response scripts are
+/// selected by request rules, but their content runs with the response context;
+/// keep this I/O out of the generic request-time value preloader.
+pub(in crate::proxy) async fn load_remote_scripts(
+    resolved: &mut Resolved,
+    at: &ReqInfo,
+    phase: ScriptPhase,
+) {
+    let (protocol, pure_spelling) = match phase {
+        ScriptPhase::Request => ("rulesFile", "reqRules"),
+        ScriptPhase::Response => ("resScript", "resRules"),
+    };
+    let Some(ops) = resolved.multi.get_mut(protocol) else {
+        return;
+    };
+    let mut loaded = HashMap::new();
+    let mut seen_script = false;
+    for op in ops
+        .iter_mut()
+        .filter(|op| script_entry_selected(op, pure_spelling, &mut seen_script))
+    {
+        if op.value_is_content || !is_http_url(op.value.trim()) {
+            continue;
+        }
+        let url = op.value.trim().to_string();
+        let result = match loaded.entry(url.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(read_url_value(&url).await)
+            }
+        };
+        match result {
+            Ok(source) => {
+                op.value = source.text.clone();
+                op.value_loaded = true;
+            }
+            Err(reason) => {
+                // Do not retry in another consumer or interpret a failed URL
+                // (or a partial response body) as code or as a local filename.
+                op.value.clear();
+                if let Ok(mut noted) = at.noted.lock() {
+                    noted.push(crate::proxy::unapplied::Unapplied {
+                        kind: crate::proxy::unapplied::Kind::RuleSourceFailed,
+                        ops: vec![op.raw.clone()],
+                        reason: format!("{reason}; rule/script source was not executed"),
+                    });
                 }
             }
         }
+        op.value_is_content = true;
     }
 }
 
@@ -376,3 +437,6 @@ pub async fn load_rule_values(resolved: &mut Resolved, at: &ReqInfo) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

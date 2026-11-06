@@ -310,10 +310,7 @@ pub fn merge_included_rules(
     let joined = rules_file_ops(resolved)
         .iter()
         .filter_map(|op| {
-            let text = match op.value_is_content {
-                true => Some(op.value.clone()),
-                false => std::fs::read_to_string(&op.value).ok(),
-            }?;
+            let text = script_text(op)?;
             Some((text, op))
         })
         // A text that is JavaScript rather than rules is executed, and what it
@@ -436,7 +433,7 @@ pub fn res_script_op(resolved: &Resolved) -> Option<&RuleOp> {
 
 /// The text a script-family operator carries: the value itself for the
 /// `{name}` and inline forms, the file it names otherwise.
-pub(super) fn script_text(op: &RuleOp) -> Option<String> {
+pub(in crate::proxy) fn script_text(op: &RuleOp) -> Option<String> {
     match op.value_is_content {
         true => Some(op.value.clone()),
         false => std::fs::read_to_string(&op.value).ok(),
@@ -565,11 +562,16 @@ pub(super) fn accumulated_script_ops<'a>(
     resolved
         .all(protocol)
         .iter()
-        .filter(|op| {
-            if raw_protocol(op) == Some(pure_spelling) {
-                return true;
-            }
-            !std::mem::replace(&mut seen_script, true)
-        })
+        .filter(|op| script_entry_selected(op, pure_spelling, &mut seen_script))
         .collect()
+}
+
+/// Shared selection for loading and execution: all pure-rule entries, but
+/// only the first script, even when its source fails to load.
+pub(super) fn script_entry_selected(
+    op: &RuleOp,
+    pure_spelling: &str,
+    seen_script: &mut bool,
+) -> bool {
+    raw_protocol(op) == Some(pure_spelling) || !std::mem::replace(seen_script, true)
 }

@@ -77,6 +77,17 @@ PORT_BASE=19100 CASES=./cases-filters.js npm run bench
 
 这里以前用几个数字概括这些语料，可那些数字跟语料对不上，彼此之间也对不上——一处说 compose 最后是 7，它的语料文件开头写 9，实际一跑是 9；paths 列了两个语料里已经没有的 `urlReplace://` 用例，却漏了确实有差异的 emoji 头和非 UTF-8 body。所以现在的声明是逐个用例写的：一个计数说不出它指的是*哪几处*差异。
 
+## 远程规则与脚本源
+
+```sh
+node run.js network --only script-sources
+node run.js network --only script-sources --whistle 2.10.10
+```
+
+`script-sources-bench.js` 使用标准代理对，以及 `PORT_BASE+2` 的真实源站、`+3` 的规则源。18 个用例覆盖四类远程源、无显式路径的 query URL、内外层响应条件、脚本选择和响应上下文。每边独立断言状态／正文／源站次数／实际头部、下载阶段与次数、源请求 Host 及凭据隔离，不只比较两个代理是否相等。
+
+重复 `resRules` URL 的读取次数有意不同：whix 每阶段共用一个快照，上游读取两次。两种次数都单独断言，归档的 `fetchPolicyDifferences` 明列该差异；这里只对照静态内容，不宣称动态源等价。其它源读取边界由 Rust 单元和真实进程回归覆盖，见[规则说明](../../docs/RULES.md#远程规则与脚本源)。
+
 ## 上游自带的测试
 
 ```sh

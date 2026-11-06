@@ -1429,3 +1429,37 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 证据（本地未入库）：`target/ws-hide-red-20261106.log`、`ws-hide-e2e-20261106.log`、`ws-hide-all-20261106.log`、`ws-hide-doc-20261106.log`、`ws-hide-clippy-20261106.log`、`ws-hide-browser-20261106.log`；差分为 `target/differential/ws-hide-fixed-20261106-2.10.8/`、`ws-hide-fixed-20261106-2.10.10/` 与 `ws-hide-fast-*`，矩阵为 `ws-hide-matrix-20261106.json`；审计复放为 `target/ws-hide-213-20261106/`，保留旧审计产物未覆盖。冻结二进制 SHA-256：`c21c95576831a86bdea47d12ed3248dbcccf7a3eee29a64e0ddf2c29136bf4ee`。
 
 **未验证：** 未跑全部 30 个网络阶段、完整 core 对照、跨平台、MSRV、远端 CI 或长期压力测试。可见性快照不追溯清除已有捕获；不承诺让外部插件停止观察流量。没有修改真实代理数据、系统代理或信任库；只本地提交，不推送。
+
+
+## 2026-11-06 远程规则与脚本源
+
+**完成：** SCRIPT-01。`reqScript`／`reqRules`／`resScript`／`resRules` 的 HTTP(S) 源不再落入本地文件读取。请求与响应阶段复用既有取值传输、脚本选择和执行入口；响应正文钩子也使用已加载内容，不把源码再次当作文件名。没有新增依赖、全局缓存、重试框架或锁文件改动。读取上限改为在流式读取中执行，并修正共用单次请求的 query-only URL、fragment 和非默认端口 Host。具体行为统一见[远程规则与脚本源](RULES.md#远程规则与脚本源)。
+
+**红灯与复核：** 旧实现下两条真实进程回归均失败：源站收到了原请求，但没有脚本生成的头，响应钩子也未执行。增量复核找到 query-only URL 被当作 authority 的问题，已补回归。测试夹具另修正 macOS 接收 socket 继承非阻塞模式的问题；超时测试会核对虚拟耗时，避免自动推进时钟掩盖超时退化。全量时遇到 16.001 秒而非精确 16 秒，按锁定 Tokio 的毫秒向上取整规则处理测试精度，没有放宽产品期限；临时将期限加倍后，测试以 31.999 秒失败，原源码恢复后通过。
+
+**兼容取舍：** 固定 2.10.13 实测确认，外层 `resScript`／`resRules` 的选择和 URL 模板仍在请求阶段；响应状态条件应放在下载或生成的规则中。本次未改变这一语义。重复 URL 在 whix 中按阶段共用一次内容，上游重复读取；专项报告单列 `fetchPolicyDifferences`，分别断言次数，不宣称动态源等价。新增诊断值 `rule-source-failed` 会持久化并在重启后恢复，API 调用方与旧构建的历史回退边界见 [API](API.md#没生效的规则) 和[安装说明](INSTALL.md#升级)。
+
+| 验证 | 结果 |
+| --- | --- |
+| 新增 Rust 回归 | 12 条真实进程测试 + 4 条单元测试；四类源、请求／响应次序、内外层条件、选择／去重、生成响应规则、非 200／重定向、恢复、截断、256 KiB 边界、期限、TLS、并发存储锁、文件／内联和持久化重启均覆盖 |
+| `cargo test --locked --all-targets` | 1295 通过，12 项沿用忽略，无失败 |
+| `cargo test --locked --doc` | 2/2 |
+| `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets -- -D warnings` | 通过 |
+| UI `typecheck`／`build`，真实代理 Chrome 流量回归 | 通过；浏览器 8/8 |
+| 两个锁定版本的相关网络门禁 | 2.10.8／2.10.10 均 6/6：`cases-bodies` 182、`cases-compose` 123、`cases-docs` 111、`cases-values` 150、`script-sources` 18、`core` 126；未知差异 0，未扩展既有豁免；core 各有 4 条单边检查和 18 项独立预期通过 |
+| 两版快速门禁 | 均 5/5；解析问题为 17462 + 2043，未知差异 0 |
+| 普通 `cargo build` 冻结二进制 | 远程源专项对 2.10.8／2.10.10 各 18 个用例、36 项独立预期通过；跨版本矩阵无新增效果差异 |
+| 2.10.13 定向对照 | 同一普通构建、同一永久专项，18 个用例、36 项独立预期通过；重新创建状态目录复放仍通过。只使用已核验归档及隔离依赖，不把它记为整套锁定基线 |
+| 预期断言负例 | 让两边源服务都返回空内容：效果相等，但 28 项独立预期失败，退出 1；不会把“两边都没执行”算通过 |
+| 文档链接与 diff | 通过 |
+
+复放入口：Rust 命令均使用 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`；浏览器为 `PLAYWRIGHT_CHANNEL=chrome npm --prefix ui-src run test:e2e:traffic`。网络门禁为 `node tests/differential/run.js network --only cases-bodies,cases-compose,cases-docs,cases-values,script-sources,core`，第二版追加 `--whistle 2.10.10`；快速门禁把 `network --only …` 换成 `fast`。永久远程专项单独使用 `--only script-sources`。
+
+证据均为未入库的本地合成流量产物：
+
+- Rust：`target/remote-scripts-red-20261106.log`、`remote-scripts-timeout-negative-final-20261106.log`、`remote-scripts-all-verified-20261106.log`、`remote-scripts-doc-verified-20261106.log`、`remote-scripts-clippy-verified-20261106.log`；前端为 `remote-scripts-ui-20261106.log`、`remote-scripts-browser-20261106.log`，均在 `target/`。
+- 相关网络及快速门禁：`target/differential/remote-scripts-final-20261106-2.10.8/`、`remote-scripts-final-20261106-2.10.10/`、`remote-scripts-fast-20261106-2.10.8/`、`remote-scripts-fast-20261106-2.10.10/`。冻结测试构建 SHA-256：`d19439ec1ed8178a82869d58d49e849d3ceb17da2df060d34cfe345fee4e3c68`。
+- 普通构建专项：`target/differential/remote-sources-production-20261106-2.10.8/`、`remote-sources-production-20261106-2.10.10/`、`remote-sources-production-matrix-20261106.json`。冻结普通构建 SHA-256：`39aade9cea2274cc404692ee7d42b54bc792014df47da9b3fe9690620f9670be`，也对应浏览器回归使用的构建。
+- 2.10.13：`target/remote-sources-oracle/final-1793971650466/`、`final-1793971651713/`；空源负例为 `final-1793971652888/`。启动器 `target/remote-sources-oracle/final-20261106.cjs`，指定 `RS_BIN` 为上述普通构建。归档保留 tarball、运行依赖和专项脚本哈希；旧审计产物未覆盖。
+
+**未验证／未纳入：** 未跑全部 31 个网络阶段、MSRV、跨平台、远端 CI、长期压力或真实外网服务。16 秒超时用真实回环 I/O 后的虚拟时钟验证，不是墙钟性能测量；HTTPS 成功场景只在隔离自签名夹具中显式启用 `--insecure-upstream`，默认拒绝该证书也有回归。远程 `frameScript`、CONNECT／WebSocket 升级响应规则和其他 JS 兼容差异另行处理，不宣称全量 2.10.13 对齐。没有修改真实代理数据、系统代理、证书信任库或依赖；只本地提交，不推送。

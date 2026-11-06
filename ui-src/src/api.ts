@@ -77,6 +77,7 @@ export type UnappliedKind =
   | 'no-weinre-server'
   | 'cipher-unusable'
   | 'script-failed'
+  | 'rule-source-failed'
   | 'missing-value';
 
 export interface Unapplied {

@@ -19,10 +19,8 @@ use super::*;
 /// without walking a single rule.
 ///
 /// Locking: takes the two `std::sync` read locks one after the other, never
-/// nested and each dropped before the `.await` at the end — which is what lets
-/// this be called from `serve`'s future. That await is the value loader, and it
-/// only ever does work when this pass added an operator whose value names a
-/// file or a URL.
+/// nested and each dropped before awaiting remote script/value loading. This
+/// keeps source I/O out of the shared rule and value store locks.
 pub(super) async fn resolve_response_phase(
     state: &AppState,
     info: &mut ReqInfo,
@@ -83,6 +81,7 @@ pub(super) async fn resolve_response_phase(
     // It substitutes against `values`, the same map every other pass here uses.
     // Reading `state.values` directly is what made a response-phase operator the
     // one place a ``` block in the rules text was invisible.
+    apply::load_remote_scripts(resolved, info, apply::ScriptPhase::Response).await;
     if let Some(carried) = apply::merge_res_rules(resolved, info, &values, is_internal_req) {
         values.extend(carried);
         apply::substitute_values(resolved, &values, tpl_ctx(&host, state.config.port, info));
@@ -446,7 +445,7 @@ impl ResBodyOps {
         ResBodyOps {
             speed: apply::res_speed_kbps(resolved),
             script: apply::res_script_op(resolved)
-                .and_then(|op| script::load_script(&op.value).map(|src| (op.raw.clone(), src))),
+                .and_then(|op| apply::script_text(op).map(|src| (op.raw.clone(), src))),
             weinre: resolved.value("weinre").map(|s| s.to_string()),
             log: LogRule::of(resolved, streaming_ct),
             write: apply::res_write_path(resolved, status),

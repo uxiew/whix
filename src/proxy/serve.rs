@@ -532,6 +532,7 @@ pub(super) async fn serve(
             .flatten();
         let tpl = tpl_ctx(&bind_host, state.config.port, &info);
         apply::substitute_values(&mut resolved, &values, tpl);
+        apply::load_remote_scripts(&mut resolved, &info, apply::ScriptPhase::Request).await;
         let mut managers =
             apply::merge_included_rules(&mut resolved, &info, &values, is_internal_req);
         for mgr in &managers {

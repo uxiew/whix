@@ -1171,7 +1171,7 @@ pinned.example.com   sniCallback://no-mitm
 
 | 算子 | 值 | 作用 |
 |----------|-------|--------|
-| `resScript` | `.js` 文件路径（或内联 JS） | 对响应执行 JavaScript |
+| `resScript` | `.js` 文件路径、HTTP(S) URL、`{value}` 或内联 JS | 对响应执行 JavaScript |
 | `frameScript` | `.js` 文件路径、`{value}` 或内联 JS | 对每个 WebSocket 帧执行 JavaScript——配合 `enable://inspect` 时，也对普通隧道的每个数据块执行 |
 
 脚本在一个内嵌的 JS 引擎里运行，有一个全局变量 `ctx`：
@@ -1398,6 +1398,22 @@ if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
 两个方向是两个任务。没有 `frameScript` 的连接不占。处理函数里的循环跑到三百万次迭代
 会被切断，和所有脚本一样。
 
+#### 远程规则与脚本源
+
+`reqScript`、`reqRules`、`resScript`、`resRules` 可以直接读取 HTTP(S) URL，和各自的文件／Values 内容走同一条执行路径；`rulesFile` 的其他别名也适用。官网的 [reqScript](https://wproxy.org/docs/rules/reqScript.html)、[resScript](https://wproxy.org/docs/rules/resScript.html)、[reqRules](https://wproxy.org/docs/rules/reqRules.html)、[resRules](https://wproxy.org/docs/rules/resRules.html) 都列出了远程 URL 形式：
+
+```text
+example.com reqScript://https://rules.example.test/request.js
+example.com resRules://https://rules.example.test/response.rules
+```
+
+- **时机：** 请求源在转发前下载并执行；响应源在收到响应头后下载并执行。外层规则的选择和 URL 模板展开仍发生在请求阶段：不要把 `includeFilter://s:201` 写在外层 `resRules`／`resScript` 行上，应写进下载或生成的规则里。固定 2.10.13 的实际行为也是如此；响应脚本内部仍能读取 `statusCode`、`resHeaders`。
+- **读取次数：** 只读取最终选中的条目（所有纯规则条目、第一条脚本）。每个请求、每个阶段中，相同 URL 共用一次下载结果，不跨请求缓存；一次失败不会切换到第二条脚本，也不会在同一阶段重试。上游重复 `resRules` URL 会读取多次，因此只保证静态源的效果对照，不保证每次返回不同内容的动态源语义相同。
+- **预算与失败：** 沿用远程值的整次读取 16 秒期限、256 KiB 内容上限；超限在读取过程中停止，不先无限缓冲。只执行完整的 HTTP 200 内容；非 200、截断、传输错误或超时均不执行任何部分，不跟随重定向。会话记录 `unapplied.kind = rule-source-failed`；下一次请求重新读取。上游的 16 秒是空闲超时，这里的整次期限更严格，也不自动重试传输错误。
+- **传输：** 使用现有上游 TLS 验证策略；不继承被代理请求的 Cookie／Authorization，`Host` 保留源 URL 的端口。`{value}`／内联内容不会被再次当作 URL 或文件名读取。
+
+这部分只覆盖 HTTP 请求／响应路径；远程 `frameScript`、CONNECT／WebSocket 升级的响应规则及其他 JavaScript 兼容差异仍未补齐。
+
 ### `log://` —— 页面的控制台，搬到这里
 
 | 算子 | 值 | 作用 |
@@ -1587,7 +1603,7 @@ example.com/old    locationHref://replace:/new
 | `headerReplace` | `{"<scope>.<name>:<pattern>":"<repl>"}` | 改写某个头的值；scope 取 `req.`/`reqH.`/`res.`/`resH.` |
 | `responseFor` | 一个名字，或 `name=<headers>` | 给**响应**加上 `x-whistle-response-for` 标注，见下文 |
 | `rule` | Values 条目名 | 引入这个条目里的规则，一并应用 |
-| `rulesFile` | 文件路径、`{value}` 或 `(inline)` | 引入规则，一并应用。也可以写成 `reqRules://`、`ruleFile://`、`ruleScript://`、`rulesScript://`、`reqScript://`，见下文 |
+| `rulesFile` | 文件路径、HTTP(S) URL、`{value}` 或 `(inline)` | 引入规则，一并应用。也可以写成 `reqRules://`、`ruleFile://`、`ruleScript://`、`rulesScript://`、`reqScript://`，见下文 |
 | `pipe` | 插件名 | 经由一个已注册的服务转发（和 `plugin` 类似） |
 
 算子的值**整个**是 `{name}` 时，或者值里任意位置出现 `${name}` 时，会被替换成同名 Values 条目的内容（来自 `--value name=…` 或控制台的 Values 面板），见[算子的值可以是什么](#算子的值可以是什么)。
@@ -1886,9 +1902,9 @@ example.com   rulesFile:///etc/whistle/c.rules    # 保留（第一条不是 req
 example.com   rulesFile:///etc/whistle/d.rules    # 丢弃
 ```
 
-> 如果留下来的候选内容看起来像 JavaScript 而不是规则，whistle 还会*执行*它（`isRulesContent`，`_original/lib/rules/index.js:41`），再把脚本输出的规则拼进去。whix 没有动态规则脚本：每个保留下来的文件都按规则文本读取。
+> 如果留下来的候选内容看起来像 JavaScript 而不是规则，whistle 还会*执行*它（`isRulesContent`，`_original/lib/rules/index.js:41`），再把脚本输出的规则拼进去。whix 也按内容判别执行脚本，再合并它生成的规则；上下文见[脚本](#脚本)。
 
-规则文本不一定非得是文件。`reqRules://{extra}` 指向一个 **Values** 条目——来自 `--value`、控制台的 Values 面板，或者规则文件里的 ``` ``` ``` 代码块——`reqRules://(…)` 则是内联写法；两者都是 `readRuleValue` 还没碰磁盘就直接返回了 `rule.value`（`_original/lib/util/index.js:1177-1179`）。
+规则文本不一定非得是文件。`reqRules://{extra}` 指向一个 **Values** 条目——来自 `--value`、控制台的 Values 面板，或者规则文件里的 ``` ``` ``` 代码块——`reqRules://(…)` 则是内联写法；两者都是 `readRuleValue` 还没碰磁盘就直接返回了 `rule.value`（`_original/lib/util/index.js:1177-1179`）。 HTTP(S) URL 的读取规则见[远程规则与脚本源](#远程规则与脚本源)。
 
 #### 生成出来的规则能做什么、不能做什么
 

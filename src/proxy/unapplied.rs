@@ -53,6 +53,8 @@ pub enum Kind {
     /// or was still running at its time limit, so nothing it did was kept:
     /// no rules it pushed, no change it made to the response.
     ScriptFailed,
+    /// A remote rule/script source failed to load completely, so none of it ran.
+    RuleSourceFailed,
     /// A body operator whose whole value is a `{name}` that names no value —
     /// in the rules text's ``` blocks or in the Values store — and which is
     /// then not applied at all, as upstream does not apply it.
