@@ -128,18 +128,15 @@ pub(super) async fn serve_upgrade(
     note_cipher_dropped(ledger, &target, resolved);
     let frame_script = frame_script_of(state, info, resolved);
     let websocket = is_websocket(&req, resolved);
-    // Which plugins may hook this session's frames. Resolving the plan contacts
-    // nothing and allocates nothing unless a rule named a registered plugin;
-    // the plugins themselves are dialled later, from inside the tunnel.
+    // Snapshot capture visibility and candidate hooks from the same rules.
+    // Plugins are contacted later, from inside the tunnel.
     let frame_plan = if websocket {
         ws::FramePlan::new(&state.plugins, resolved, info)
     } else {
         ws::FramePlan::default()
     };
     // What `enable://ignoreSend|ignoreReceive|pauseSend|pauseReceive` asked to
-    // happen to each direction. Read here rather than inside the plan: the plan
-    // collapses to its default when no plugin is named, and these flags have to
-    // survive that.
+    // happen to each direction, independently of capture visibility and hooks.
     let frame_flow = ws::FrameFlow::of(resolved);
     // An upgrade to something other than WebSocket is relayed as bytes, and
     // `enable://inspect` asks for those to be shown — see `ws::inspected_relay`.

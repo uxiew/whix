@@ -178,15 +178,13 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
-/// The frame hooks a WebSocket session *may* run: the plugins its rules named,
-/// resolved but not yet contacted.
-///
-/// Building one is pure and allocation-free when no rule named a registered
-/// plugin — the normal case, and the reason a plain WebSocket costs nothing.
-/// The plugins are dialled later, from inside the tunnel, so a plugin's
-/// handshake never delays the client's.
+/// Capture visibility and optional frame hooks, resolved once per connection.
+/// Request metadata is only copied when a plugin needs it. Hooks are contacted
+/// inside the tunnel, so their handshake never delays the client's.
 #[derive(Default, Clone)]
 pub struct FramePlan {
+    // Independent of whether any plugin hooks the connection.
+    hidden: bool,
     /// Candidate plugins, in rule order, at most one entry per plugin.
     matches: Vec<PluginMatch>,
     method: String,
@@ -204,6 +202,7 @@ impl FramePlan {
     /// would be a trap rather than a distinction. A plugin named by both schemes
     /// still hooks once.
     pub fn new(plugins: &Plugins, resolved: &Resolved, info: &ReqInfo) -> Self {
+        let hidden = crate::proxy::apply::hidden_from_capture(resolved);
         let mut matches: Vec<PluginMatch> = Vec::new();
         for m in crate::plugins::matched(resolved) {
             if plugins.reachable(&m.name) && !matches.iter().any(|o| o.name == m.name) {
@@ -211,9 +210,13 @@ impl FramePlan {
             }
         }
         if matches.is_empty() {
-            return FramePlan::default();
+            return FramePlan {
+                hidden,
+                ..Default::default()
+            };
         }
         FramePlan {
+            hidden,
             matches,
             method: info.method.clone(),
             url: info.full_url.clone(),
@@ -266,9 +269,8 @@ impl FramePlan {
     }
 }
 
-/// Frame-aware bidirectional tunnel: captures every frame into `state` under
-/// `session`, offers each data frame to `script`, and then to the plugins in
-/// `plan`.
+/// Frame-aware bidirectional tunnel: applies scripts/hooks regardless of
+/// visibility, but only publishes frames and controls when `plan` allows capture.
 pub async fn capturing_tunnel<A, B>(
     client: A,
     upstream: B,
@@ -285,6 +287,9 @@ pub async fn capturing_tunnel<A, B>(
     // dialling the plugins now overlaps with the client composing its first
     // frame instead of delaying the handshake.
     let (send_hooks, receive_hooks) = plan.connect(&state.plugins, session).await;
+    // Hooks keep the connection identity; capture/control exposure is optional.
+    // Do not infer visibility from the evictable session cache.
+    let session = (!plan.hidden).then_some(session);
     // Every live connection can change direction modes at runtime.
     let pause = Some(Arc::new(SessionPause::new(flow)));
     // The script is evaluated here, once, for the life of the connection — as
@@ -309,16 +314,14 @@ pub async fn capturing_tunnel<A, B>(
     let mut writers = SessionWriters::new(uw, cw);
     writers.pause = pause.clone();
     let writers = Arc::new(writers);
-    state
-        .ws_write
-        .lock()
-        .unwrap()
-        .insert(session, writers.clone());
-    state
-        .ws_pause
-        .lock()
-        .unwrap()
-        .insert(session, pause.as_ref().unwrap().clone());
+    if let Some(id) = session {
+        state.ws_write.lock().unwrap().insert(id, writers.clone());
+        state
+            .ws_pause
+            .lock()
+            .unwrap()
+            .insert(id, pause.as_ref().unwrap().clone());
+    }
     let (uw, cw) = (writers.to_server(), writers.to_client());
     let registration = Registration {
         state: state.clone(),
@@ -389,14 +392,16 @@ pub async fn capturing_tunnel<A, B>(
 
 struct Registration {
     state: Arc<AppState>,
-    session: u64,
+    session: Option<u64>,
     writers: Arc<SessionWriters>,
 }
 impl Drop for Registration {
     fn drop(&mut self) {
         self.writers.abort();
-        self.state.ws_pause.lock().unwrap().remove(&self.session);
-        self.state.ws_write.lock().unwrap().remove(&self.session);
+        if let Some(id) = self.session {
+            self.state.ws_pause.lock().unwrap().remove(&id);
+            self.state.ws_write.lock().unwrap().remove(&id);
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let writers = self.writers.clone();
             runtime.spawn(async move {
@@ -872,7 +877,7 @@ struct Leg {
     writers: Arc<SessionWriters>,
 }
 
-async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: u64) -> Sent
+async fn pump<R, W>(r: R, w: W, leg: Leg, state: Arc<AppState>, session: Option<u64>) -> Sent
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
@@ -920,12 +925,7 @@ async fn write_injections<W: AsyncWrite + Unpin>(
         if deliver(w, true, opcode, &frame.data, ctx).await != Sent::Ok {
             return;
         }
-        ctx.state.record_frame(WsFrame::new(
-            ctx.session,
-            ctx.direction,
-            opcode,
-            &frame.data,
-        ));
+        ctx.record(ctx.direction, opcode, &frame.data, false, false);
     }
 }
 
@@ -947,11 +947,20 @@ struct FrameCtx {
     hooks: Vec<FrameHook>,
     mode: DirMode,
     state: Arc<AppState>,
-    session: u64,
+    session: Option<u64>,
     writers: Arc<SessionWriters>,
 }
 
 impl FrameCtx {
+    fn record(&self, direction: &'static str, opcode: u8, data: &[u8], held: bool, ignored: bool) {
+        if let Some(session) = self.session {
+            let mut frame = WsFrame::new(session, direction, opcode, data);
+            frame.held = held;
+            frame.ignored = ignored;
+            self.state.record_frame(frame);
+        }
+    }
+
     /// Run the script and the hooks over one frame and record it, returning the
     /// opcode and payload to deliver — or `None` when it is not to be delivered
     /// at all: the script or a hook dropped it, or `enable://ignore…` discarded
@@ -992,12 +1001,7 @@ impl FrameCtx {
                     .await
                 {
                     let direction = if sent.to_server { "send" } else { "receive" };
-                    self.state.record_frame(WsFrame::new(
-                        self.session,
-                        direction,
-                        code,
-                        &sent.data,
-                    ));
+                    self.record(direction, code, &sent.data, false, false);
                 }
             }
             let kept = outcome.frame?;
@@ -1018,22 +1022,19 @@ impl FrameCtx {
         // that a frame was dropped instead of just not showing it. A held frame
         // is flagged the same way for the same reason: what is waiting is worth
         // more than a count of it.
-        let mut record = WsFrame::new(self.session, self.direction, opcode, &payload);
-        record.held = held;
-
         // `enable://ignoreSend|ignoreReceive` discards this direction's data
         // frames. Control frames are exempt: dropping a `close` would leave the
         // tunnel open with both ends believing otherwise, and dropping a
         // `ping`/`pong` breaks the keep-alive the endpoints agreed on —
         // upstream's ignore path likewise only ever withholds data
         // (`opts.data`, `_original/lib/socket-mgr.js:249-274`).
-        if self.mode == DirMode::Ignore && is_data_frame(opcode) {
-            record.ignored = true;
-            self.state.record_frame(record);
-            return None;
+        let ignored = self.mode == DirMode::Ignore && is_data_frame(opcode);
+        self.record(self.direction, opcode, &payload, held, ignored);
+        if ignored {
+            None
+        } else {
+            Some((opcode, payload))
         }
-        self.state.record_frame(record);
-        Some((opcode, payload))
     }
 }
 
@@ -1164,7 +1165,9 @@ where
     let outcome = 'leg: loop {
         let discard = gate.discard_held.swap(false, Ordering::AcqRel);
         if (discard || gate.mode() == DirMode::Ignore) && !held.is_empty() {
-            ignore_held_marks(&ctx.state, ctx.session, ctx.direction, held.len());
+            if let Some(session) = ctx.session {
+                ignore_held_marks(&ctx.state, session, ctx.direction, held.len());
+            }
             held.clear();
             held_bytes = 0;
             gate.held.store(0, Ordering::Release);
@@ -1281,7 +1284,9 @@ async fn flush<W: AsyncWrite + Unpin>(
         }
     }
     gate.held.store(held.len(), Ordering::Release);
-    clear_held_marks(&ctx.state, ctx.session, ctx.direction, sent);
+    if let Some(session) = ctx.session {
+        clear_held_marks(&ctx.state, session, ctx.direction, sent);
+    }
     outcome
 }
 
@@ -1401,6 +1406,7 @@ mod tests {
     mod fragment_cases;
     mod script_startup_cases;
     mod tcp_control_cases;
+    mod visibility_cases;
     use super::*;
     use crate::ca::CertAuthority;
     use crate::config::Config;
