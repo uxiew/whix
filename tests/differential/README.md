@@ -99,6 +99,19 @@ node run.js network --only frame-sources --whistle 2.10.10
 
 两方向使用相同的改写，避免把 2.10.8 的已知 WS 方向缺陷算成本项差异；WS 检查跨帧状态，TCP 用不受分段影响的逐字符变换和拼接字节判定。即使两个代理结果相同，任何一边违反固定预期也会退出 1。WSS、HTTPS 来源、边界与可见性等另由 Rust 真实进程回归验证。
 
+## ctx.destroy 定向对照
+
+`frame-destroy-bench.js` 专用于已准备的 **Whistle 2.10.13** 标准代理对，不替换现有 2.10.8／2.10.10 锁定基线。先在隔离目录启动代理对，再运行：
+
+```sh
+WHISTLE_PKG=/path/to/whistle-2.10.13 PORT_BASE=23680 \
+  node tests/differential/frame-destroy-bench.js --json result.json
+```
+
+用 `PORT_BASE+2/+3` 提供 WS 和 TCP 对端，共 20 个用例、40 项独立预期。检查双端数据、握手后 EOF／重置、WS 异常关闭且没有 Close 帧；不关闭的上游场景必须完成后续 `LATE` 数据往返。重置原始事件保留，不把任意网络错误当作关闭。
+
+2.10.13 的 12 项无效调用（WS 顶层 3 项、TCP 9 项）在 `report.expectedUpstreamGap` 明列，双方分别接受各自已验证的固定预期。即使结果相同，任何一方不符合预期也退出 1。TCP 顶层只向源站注入，避免混入上游已知的“客户端注入先于 200”错误；不放宽握手解析。版本不符直接拒绝，不能把旧版没有该 API 算成通过。常规 Rust 门禁中的 `frame_destroy_e2e` 和单元测试始终验证 whix 自身的关闭契约。
+
 ## 上游自带的测试
 
 ```sh

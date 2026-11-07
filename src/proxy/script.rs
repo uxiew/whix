@@ -27,7 +27,11 @@
 //! `Result` here and the caller refuses the request instead of routing it
 //! somewhere the rules did not ask for. See `docs/RULES.md`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1077,6 +1081,11 @@ pub struct FrameOutcome {
     pub frame: Option<ScriptFrame>,
 }
 
+/// A connection-aware reply. `Break` aborts both directions, retaining only
+/// preceding injections that can be written immediately; no triggering frame
+/// or later output is delivered. `Continue` preserves ordinary frame handling.
+pub type FrameAction = ControlFlow<Vec<ScriptFrame>, FrameOutcome>;
+
 /// One connection's `frameScript`, running.
 ///
 /// The script is evaluated **once**, when the connection opens, and its
@@ -1096,11 +1105,12 @@ pub struct FrameScript {
     /// Which directions have a handler right now: bit 0 toward the server,
     /// bit 1 toward the client. Read by a leg before it bothers the script.
     handles: Arc<std::sync::atomic::AtomicU8>,
+    destroyed: Arc<AtomicBool>,
 }
 
 struct FrameJob {
     frame: ScriptFrame,
-    reply: tokio::sync::oneshot::Sender<FrameOutcome>,
+    reply: tokio::sync::oneshot::Sender<FrameAction>,
 }
 
 /// What starting a script produced.
@@ -1120,28 +1130,52 @@ impl FrameScript {
     ///
     /// A script that throws while it is evaluated is no script at all: nothing
     /// it sent is delivered and no handler is kept, which is upstream's
-    /// `execScriptSync` returning false.
+    /// `execScriptSync` returning false. This output-only compatibility entry
+    /// point treats destruction as no script; transports use [`Self::start_controlled`].
     pub async fn start(spec: FrameScriptSpec) -> FrameScriptStart {
+        Self::start_controlled(spec)
+            .await
+            .continue_value()
+            .unwrap_or_default()
+    }
+
+    /// Start for a transport that honors `ctx.destroy()`. `Break` discards
+    /// pending startup injections and tells the caller to abort the connection.
+    pub async fn start_controlled(spec: FrameScriptSpec) -> ControlFlow<(), FrameScriptStart> {
         let (jobs, inbox) = std::sync::mpsc::channel::<FrameJob>();
         let (ready, started) = tokio::sync::oneshot::channel();
         let handles = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let flags = handles.clone();
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let stopped = destroyed.clone();
         let spawned = std::thread::Builder::new()
             .name("frame-script".into())
             // The engine's parser recurses; the default two megabytes are what
             // a deeply nested script would find first.
             .stack_size(8 * 1024 * 1024)
-            .spawn(move || frame_script_thread(spec, inbox, ready, flags));
+            .spawn(move || frame_script_thread(spec, inbox, ready, flags, stopped));
         if let Err(err) = spawned {
             tracing::warn!("frameScript: no thread to run it on: {err}");
-            return FrameScriptStart::default();
+            return ControlFlow::Continue(FrameScriptStart::default());
         }
-        let Ok(Some(sent)) = started.await else {
-            return FrameScriptStart::default();
+        let outcome = match started.await {
+            Ok(ControlFlow::Break(_)) => return ControlFlow::Break(()),
+            Ok(ControlFlow::Continue(outcome)) => outcome,
+            Err(_) => FrameOutcome::default(),
         };
-        let script = (handles.load(std::sync::atomic::Ordering::Acquire) != 0)
-            .then_some(FrameScript { jobs, handles });
-        FrameScriptStart { script, sent }
+        let script = (handles.load(Ordering::Acquire) != 0).then_some(FrameScript {
+            jobs,
+            handles,
+            destroyed,
+        });
+        ControlFlow::Continue(FrameScriptStart {
+            script,
+            sent: outcome.sent,
+        })
+    }
+
+    pub(crate) fn is_destroyed(&self) -> bool {
+        self.destroyed.load(Ordering::Acquire)
     }
 
     /// Whether the script has anything to say about frames going this way.
@@ -1150,31 +1184,43 @@ impl FrameScript {
         self.handles.load(std::sync::atomic::Ordering::Acquire) & bit != 0
     }
 
-    /// Hand one frame to the script. A script that has died — its thread is
-    /// gone — leaves the frame as it came.
+    /// Output-only compatibility entry point. An engine failure leaves the
+    /// frame unchanged, while explicit destruction drops it. Transports use
+    /// [`Self::relay_controlled`] to distinguish destruction from a dropped frame.
     pub async fn relay(&self, frame: ScriptFrame) -> FrameOutcome {
+        match self.relay_controlled(frame).await {
+            ControlFlow::Continue(outcome) => outcome,
+            ControlFlow::Break(sent) => FrameOutcome { sent, frame: None },
+        }
+    }
+
+    /// Relay for a transport: unlike the output-only compatibility entry point,
+    /// this distinguishes a dropped frame from destruction of the connection.
+    pub async fn relay_controlled(&self, frame: ScriptFrame) -> FrameAction {
+        if self.is_destroyed() {
+            return ControlFlow::Continue(FrameOutcome::default());
+        }
         let (reply, answer) = tokio::sync::oneshot::channel();
         let job = FrameJob {
             frame: frame.clone(),
             reply,
         };
-        if self.jobs.send(job).is_err() {
-            return FrameOutcome {
-                sent: Vec::new(),
-                frame: Some(frame),
-            };
-        }
-        answer.await.unwrap_or(FrameOutcome {
-            sent: Vec::new(),
-            frame: Some(frame),
+        // An unsent job drops its reply too; the same fallback handles a dead
+        // worker and one stopped while this job was queued behind destroy().
+        let _ = self.jobs.send(job);
+        answer.await.unwrap_or_else(|_| {
+            ControlFlow::Continue(FrameOutcome {
+                frame: (!self.is_destroyed()).then_some(frame),
+                ..Default::default()
+            })
         })
     }
 }
 
 /// What a frame script's `ctx` is, and how frames get in and out of it.
 ///
-/// `ctx` has upstream's four members (`sendToServer`, `sendToClient`, and the
-/// two handler slots, `getScriptContext` with `frameOpts`,
+/// `ctx` has `destroy`, `sendToServer`, `sendToClient`, and the two handler
+/// slots (`getScriptContext` with `frameOpts`,
 /// `_original/lib/rules/index.js:387-393`) and this port's own two, `frame` and
 /// `direction`, for the one-line shape described on [`FrameScript`]'s caller.
 ///
@@ -1207,6 +1253,7 @@ impl FrameScript {
 ///   the frame that came in.
 const FRAME_GLUE: &str = r#"
 var ctx = {
+    destroy: function () { __frame.destroy(); },
     sendToServer: function (data, opts) { return __frame.send(true, data, opts); },
     sendToClient: function (data, opts) { return __frame.send(false, data, opts); },
     handleSendToClientFrame: null,
@@ -1218,6 +1265,8 @@ var __frame = (function (global) {
     'use strict';
     var ctx = global.ctx;
     var indirectEval = eval;
+    var requestDestroy = __frameDestroy;
+    var destroyed = false;
     // What the script has sent since the last time anyone asked.
     var sent = [];
     // The script's own text, kept for the one-line shape, which is evaluated
@@ -1276,7 +1325,7 @@ var __frame = (function (global) {
                 data = Buffer.from(((e && e.message) || 'Error: unknown') + ' (' + name + ')');
             }
         }
-        if (!data) { return null; }
+        if (destroyed || !data) { return null; }
         var binary = 'binary' in opts ? !!opts.binary : textual ? false : wasBinary;
         return [bin(data), binary];
     }
@@ -1299,10 +1348,19 @@ var __frame = (function (global) {
     }
 
     return {
+        destroy: function () {
+            if (destroyed) { return; }
+            destroyed = true;
+            early = [];
+            // Startup output has not been committed. Handler injections that
+            // preceded destroy have already been transformed and can be sent.
+            requestDestroy(starting ? [] : take());
+        },
         // `ctx.sendToServer` / `ctx.sendToClient`.
         send: function (toServer, data, opts) {
+            if (destroyed) { return; }
             data = toBuffer(data, opts && opts.charset);
-            if (!data) { return; }
+            if (destroyed || !data) { return; }
             var own = {};
             if (opts) { for (var k in opts) { own[k] = opts[k]; } }
             own.frameScript = true;
@@ -1313,6 +1371,7 @@ var __frame = (function (global) {
         },
         // Called once the script has been evaluated: [handlers, sent].
         started: function (text) {
+            if (destroyed) { return [0, []]; }
             source = text;
             starting = false;
             legacy = handlers() === 0 && /\bctx\.frame\b/.test(text);
@@ -1325,6 +1384,7 @@ var __frame = (function (global) {
         },
         // One frame that arrived: [handlers, sent, frame-or-null].
         relay: function (toServer, data, binary) {
+            if (destroyed) { return [0, [], null]; }
             if (legacy) {
                 if (binary) { return [handlers(), [], [data, binary]]; }
                 var text = fromBin(data).toString();
@@ -1335,6 +1395,7 @@ var __frame = (function (global) {
                 try { indirectEval(source); } catch (e) { ctx.frame = { data: text }; }
                 ctx.sendToServer = quiet;
                 ctx.sendToClient = quieter;
+                if (destroyed) { return [0, [], null]; }
                 return [handlers(), [], [bin(Buffer.from(String(ctx.frame.data))), false]];
             }
             var buf = fromBin(data);
@@ -1346,46 +1407,88 @@ var __frame = (function (global) {
 })(this);
 "#;
 
-/// The thread a [`FrameScript`] lives on: evaluate the script, say how that
-/// went, then answer frames until every leg has let go of the channel.
+/// The native boundary owns the pending reply, not JavaScript state. Destroy
+/// can answer it immediately, even if user code then throws or exhausts its
+/// budget; an abandoned engine never needs to be entered again to read a flag.
+struct FrameControl {
+    destroyed: Arc<AtomicBool>,
+    reply: RefCell<Option<tokio::sync::oneshot::Sender<FrameAction>>>,
+}
+impl FrameControl {
+    fn install(self: Rc<Self>, ctx: &mut Context) -> Option<()> {
+        // SAFETY: FrameControl contains only Rust-owned channels and an atomic
+        // flag, never GC-managed JavaScript values. The closure owns its Rc.
+        let destroy = unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                if !self.destroyed.swap(true, Ordering::AcqRel) {
+                    let sent = args
+                        .first()
+                        .and_then(|value| value.to_json(ctx).ok().flatten())
+                        .map(|value| script_frames(&value))
+                        .unwrap_or_default();
+                    self.answer(ControlFlow::Break(sent));
+                }
+                Ok(JsValue::undefined())
+            })
+        };
+        ctx.register_global_callable(js_string!("__frameDestroy"), 1, destroy)
+            .ok()?;
+        Some(())
+    }
+    fn answer(&self, outcome: FrameAction) {
+        if let Some(reply) = self.reply.borrow_mut().take() {
+            let _ = reply.send(outcome);
+        }
+    }
+}
+
+/// One connection's engine thread. Terminal replies also wake both async legs:
+/// the destroying call supplies the abort action; queued calls only drop data.
 fn frame_script_thread(
     spec: FrameScriptSpec,
     inbox: std::sync::mpsc::Receiver<FrameJob>,
-    ready: tokio::sync::oneshot::Sender<Option<Vec<ScriptFrame>>>,
+    ready: tokio::sync::oneshot::Sender<FrameAction>,
     handles: Arc<std::sync::atomic::AtomicU8>,
+    destroyed: Arc<AtomicBool>,
 ) {
-    let Some((mut ctx, sent)) = start_frame_script(&spec, &handles) else {
-        let _ = ready.send(None);
+    let control = Rc::new(FrameControl {
+        destroyed,
+        reply: RefCell::new(Some(ready)),
+    });
+    let Some((mut ctx, sent)) = start_frame_script(&spec, &handles, control.clone()) else {
+        control.reply.borrow_mut().take();
         return;
     };
-    if ready.send(Some(sent)).is_err() {
+    if control.destroyed.load(Ordering::Acquire) {
         return;
     }
+    control.answer(ControlFlow::Continue(FrameOutcome { sent, frame: None }));
     while let Ok(job) = inbox.recv() {
-        let outcome = match relay_frame(&mut ctx, &job.frame, &handles) {
+        *control.reply.borrow_mut() = Some(job.reply);
+        let ran = relay_frame(&mut ctx, &job.frame, &handles);
+        if control.destroyed.load(Ordering::Acquire) {
+            return;
+        }
+        let outcome = match ran {
             Ok(outcome) => outcome,
-            // A handler still running at its limit leaves the engine in the
-            // middle of a call: the script is over for this connection. Every
-            // frame from here on goes through as it came — this one too, and
-            // the legs stop asking once the handlers are gone.
             Err(Stopped::OutOfTime) => {
                 tracing::warn!(
                     "frameScript: a handler {}; frames on this connection now pass unscripted",
                     Stopped::OutOfTime
                 );
-                handles.store(0, std::sync::atomic::Ordering::Release);
-                let _ = job.reply.send(FrameOutcome {
-                    sent: Vec::new(),
+                handles.store(0, Ordering::Release);
+                control.answer(ControlFlow::Continue(FrameOutcome {
                     frame: Some(job.frame),
-                });
+                    ..Default::default()
+                }));
                 return;
             }
             Err(_) => FrameOutcome {
-                sent: Vec::new(),
                 frame: Some(job.frame),
+                ..Default::default()
             },
         };
-        let _ = job.reply.send(outcome);
+        control.answer(ControlFlow::Continue(outcome));
     }
 }
 
@@ -1393,8 +1496,10 @@ fn frame_script_thread(
 fn start_frame_script(
     spec: &FrameScriptSpec,
     handles: &std::sync::atomic::AtomicU8,
+    control: Rc<FrameControl>,
 ) -> Option<(Context, Vec<ScriptFrame>)> {
     let mut ctx = script_engine()?;
+    control.install(&mut ctx)?;
     // The request's half of the context, as a rules script has it — minus
     // `rules` and `values`, which a frame script is not given
     // (`getScriptContext`'s `frameOpts` branch).
@@ -2971,3 +3076,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "script_destroy_tests.rs"]
+mod destroy_tests;

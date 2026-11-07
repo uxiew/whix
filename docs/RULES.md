@@ -1398,6 +1398,28 @@ if (ctx.direction === 'send') ctx.frame.data = ctx.frame.data.toUpperCase();
 两个方向是两个任务。没有 `frameScript` 的连接不占。处理函数里的循环跑到三百万次迭代
 会被切断，和所有脚本一样。
 
+#### ctx.destroy：中止当前连接
+
+在 `frameScript` 顶层或任一方向的处理函数中调用 `ctx.destroy()`，会中止当前 WS/WSS、检查型 CONNECT 或原始 Upgrade 的两端连接：
+
+```js
+var c = ctx;
+c.handleSendToServerFrame = function (buf) {
+  if (String(buf) === 'stop') {
+    c.destroy();
+    return;
+  }
+  return buf;
+};
+```
+
+- 这是中止，不是正常 WebSocket Close 握手：不发送 Close 帧，也不等对方回复。对端可能看到 EOF 或连接重置；已经发到对端的字节不能撤回。
+- 触发帧、返回值、异常替代帧以及 destroy 之后的注入都不会发送。处理函数之前产生的注入只尝试立即可写的部分，不等写锁或背压；因此不能把“先 send，再 destroy”当作保证送达的刷新操作。顶层中止会丢弃尚未发出的启动注入。
+- 重复调用没有额外作用。随后抛错或继续执行 JS 不会撤回关闭请求；连接不等剩余代码结束，JS 仍受原有执行预算约束。关闭后会清理实时控制，另一条连接不受影响；隐藏连接也能关闭，但不新增捕获记录。
+- [`官网`](https://wproxy.org/docs/rules/frameScript.html) 从 2.10.11 起提供此 API。固定 2.10.13 实测只有 WS 处理函数调用生效：顶层执行时连接尚未注册，检查型 TCP 又缺少传给销毁回调的 `reqId`。whix 不复制这两处无效行为；差分分别断言并明列上游缺口。
+
+Rust 低层接口保留 `FrameScriptStart`、`FrameOutcome` 的字段以及 `start`／`relay` 签名；这些兼容入口只返回输出，不管理外部连接。管理传输的调用方应使用 `start_controlled`／`relay_controlled`，对 `ControlFlow::Break` 执行中止，不能把它与普通丢帧混为一谈。内置代理已使用这两个入口。
+
 #### 远程规则与脚本源
 
 `reqScript`、`reqRules`、`resScript`、`resRules`、`frameScript` 可以直接读取 HTTP(S) URL，和各自的文件／Values 内容走同一条执行路径；`rulesFile` 的其他别名也适用。官网的 [reqScript](https://wproxy.org/docs/rules/reqScript.html)、[resScript](https://wproxy.org/docs/rules/resScript.html)、[reqRules](https://wproxy.org/docs/rules/reqRules.html)、[resRules](https://wproxy.org/docs/rules/resRules.html)、[frameScript](https://wproxy.org/docs/rules/frameScript.html) 都列出了远程 URL 形式：
@@ -1415,7 +1437,7 @@ chat.example.com frameScript://https://rules.example.test/frame.js
 - **预算与失败：** 沿用远程值的整次读取 16 秒期限、256 KiB 内容上限；超限在读取过程中停止，不先无限缓冲。只执行完整的 HTTP 200 内容；非 200、截断、传输错误或超时均不执行任何部分，不跟随重定向。会话记录 `unapplied.kind = rule-source-failed`；下一次请求或连接重新读取。上游的 16 秒是空闲超时，这里的整次期限更严格，也不自动重试传输错误。
 - **传输：** 使用现有上游 TLS 验证策略；不继承被代理请求的 Cookie／Authorization，`Host` 保留源 URL 的端口。`{value}`／内联内容不会被再次当作 URL 或文件名读取。
 
-CONNECT／WebSocket 升级的响应规则及其他 JavaScript 兼容差异仍未补齐；`statusCode://101` 本地模拟的空连接也仍未接入帧脚本。这次只补来源读取，不改变已有脚本能力。
+CONNECT／WebSocket 升级的响应规则及其他 JavaScript 兼容差异仍未补齐；`statusCode://101` 本地模拟的空连接也仍未接入帧脚本。其它未实现的 JavaScript 语义仍需分别对照验证。
 
 ### `log://` —— 页面的控制台，搬到这里
 

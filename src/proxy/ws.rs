@@ -36,6 +36,7 @@ pub(crate) use tcp::inspected_relay_with_flow;
 
 use message::Messages;
 use std::io;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -298,7 +299,10 @@ pub async fn capturing_tunnel<A, B>(
     // file, which is how `frameScript.md`'s example opens — goes out before
     // either side has said anything.
     let started = match script {
-        Some(spec) => FrameScript::start(spec).await,
+        Some(spec) => match FrameScript::start_controlled(spec).await {
+            ControlFlow::Continue(started) => started,
+            ControlFlow::Break(()) => return,
+        },
         None => FrameScriptStart::default(),
     };
     let script = started.script;
@@ -929,6 +933,40 @@ async fn write_injections<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Check the sticky script decision again whenever a suspended output resumes.
+/// The outer abort select alone cannot prevent another ready leg from being
+/// polled in the same turn. Terminal pre-destroy injections deliberately bypass
+/// this guard and use the one-poll path below.
+async fn write_unless_destroyed<T>(
+    script: Option<&FrameScript>,
+    future: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        if script.is_some_and(FrameScript::is_destroyed) {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "frameScript destroyed the connection",
+            )));
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// Abort is not a graceful flush. Deliver preceding script injections only
+/// while their writers are ready; a blocked peer or held writer cannot delay
+/// the same close signal used by Disconnect. Dropping a pending write is
+/// intentional here: an abort may leave an incomplete frame on the wire.
+async fn write_before_abort(future: impl std::future::Future<Output = ()>) {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let _ = future.as_mut().poll(cx);
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
 /// The opcode a script's frame goes out under.
 fn opcode_of(frame: &ScriptFrame) -> u8 {
     match frame.binary {
@@ -961,6 +999,20 @@ impl FrameCtx {
         }
     }
 
+    async fn send_script_frames(&self, frames: &[ScriptFrame]) {
+        for sent in frames {
+            let code = opcode_of(sent);
+            if self
+                .writers
+                .send_frame(sent.to_server, code, &sent.data)
+                .await
+            {
+                let direction = if sent.to_server { "send" } else { "receive" };
+                self.record(direction, code, &sent.data, false, false);
+            }
+        }
+    }
+
     /// Run the script and the hooks over one frame and record it, returning the
     /// opcode and payload to deliver — or `None` when it is not to be delivered
     /// at all: the script or a hook dropped it, or `enable://ignore…` discarded
@@ -968,6 +1020,9 @@ impl FrameCtx {
     ///
     /// `held` marks the capture as waiting for a release rather than delivered.
     async fn process(&mut self, frame: Frame, held: bool) -> Option<(u8, Bytes)> {
+        if self.script.as_ref().is_some_and(FrameScript::is_destroyed) {
+            return None;
+        }
         let mut payload = Bytes::from(frame.payload);
         let mut opcode = frame.opcode;
         // A whole text or binary message: the script may rewrite it, retype it,
@@ -984,26 +1039,27 @@ impl FrameCtx {
             && matches!(opcode, OPCODE_TEXT | OPCODE_BINARY)
             && script.handles(self.to_server)
         {
-            let outcome = script
-                .relay(ScriptFrame {
+            let outcome = match script
+                .relay_controlled(ScriptFrame {
                     to_server: self.to_server,
                     data: payload.to_vec(),
                     binary: opcode == OPCODE_BINARY,
                 })
-                .await;
-            // What the handler sent goes first, whichever way it is going —
-            // upstream's `sendToClient` writes before the handler has returned.
-            for sent in &outcome.sent {
-                let code = opcode_of(sent);
-                if self
-                    .writers
-                    .send_frame(sent.to_server, code, &sent.data)
-                    .await
-                {
-                    let direction = if sent.to_server { "send" } else { "receive" };
-                    self.record(direction, code, &sent.data, false, false);
+                .await
+            {
+                ControlFlow::Continue(outcome) => outcome,
+                ControlFlow::Break(sent) => {
+                    write_before_abort(self.send_script_frames(&sent)).await;
+                    self.writers.abort();
+                    return None;
                 }
-            }
+            };
+            write_unless_destroyed(self.script.as_ref(), async {
+                self.send_script_frames(&outcome.sent).await;
+                Ok(())
+            })
+            .await
+            .ok()?;
             let kept = outcome.frame?;
             opcode = opcode_of(&kept);
             payload = Bytes::from(kept.data);
@@ -1015,6 +1071,9 @@ impl FrameCtx {
                 // it never happened as far as the other end is concerned.
                 None => return None,
             }
+        }
+        if self.script.as_ref().is_some_and(FrameScript::is_destroyed) {
+            return None;
         }
         // Capture the (possibly rewritten) frame for the Network view. An
         // ignored frame is recorded too, flagged — upstream does the same
@@ -1072,9 +1131,12 @@ async fn deliver<W: AsyncWrite + Unpin>(
     if opcode == OPCODE_CLOSE {
         ctx.writers.closing.store(true, Ordering::Release);
     }
-    if write_frame(w, fin, opcode, payload, ctx.to_server)
-        .await
-        .is_err()
+    if write_unless_destroyed(
+        ctx.script.as_ref(),
+        write_frame(w, fin, opcode, payload, ctx.to_server),
+    )
+    .await
+    .is_err()
     {
         return Sent::Failed;
     }
@@ -1104,6 +1166,9 @@ where
         };
         let fin = frame.fin;
         let Some((opcode, payload)) = ctx.process(frame, false).await else {
+            if !ctx.writers.live() {
+                break Sent::Failed;
+            }
             continue;
         };
         let sent = deliver(&mut w, fin, opcode, &payload, &ctx).await;
@@ -1221,6 +1286,9 @@ where
         let fin = frame.fin;
         let holding = ctx.mode == DirMode::Pause;
         let Some((opcode, payload)) = ctx.process(frame, holding).await else {
+            if !ctx.writers.live() {
+                break Sent::Failed;
+            }
             if !holding {
                 gate.end_frame(fin, original_opcode);
             }
@@ -1403,6 +1471,7 @@ fn dropped(fin: bool, opcode: u8) -> Option<Bytes> {
 mod tests {
     mod concurrency_cases;
     mod control_cases;
+    pub(super) mod destroy_cases;
     mod fragment_cases;
     mod script_startup_cases;
     mod tcp_control_cases;
@@ -1416,7 +1485,7 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::runtime::Runtime;
 
-    fn rt() -> Runtime {
+    pub(super) fn rt() -> Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1429,7 +1498,7 @@ mod tests {
     /// One dir per state, not one per run: these tests execute in parallel and
     /// would otherwise race to write the same root CA, now and then reading a
     /// half-written PEM back.
-    fn state_with(plugins: crate::plugins::Plugins) -> Arc<AppState> {
+    pub(super) fn state_with(plugins: crate::plugins::Plugins) -> Arc<AppState> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let config = Config {

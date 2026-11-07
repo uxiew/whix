@@ -1498,3 +1498,38 @@ Q/S/O/R/U/P/D/M 编号均指 [ROADMAP.md](ROADMAP.md)。这是一份审查快照
 - 普通构建、浏览器与最终差分使用的二进制 SHA-256：`0e7f729cebbf2ae04f2cb5b302968265d5997784f738dbf32eda13d8a0a8cca4`。
 
 **未纳入／未验证：** 不包括 `ctx.destroy` 等 JS 语义、`statusCode://101` 本地模拟 WS 或升级响应规则。未跑全部 32 个网络阶段、MSRV、跨平台、远端 CI、长期压力、真实外网来源或源码包的完整构建验证；HTTPS 成功用例仅在隔离自签名夹具显式启用 `--insecure-upstream`，默认拒绝也有回归。没有修改真实代理数据、系统代理或证书信任库；只本地提交，不推送。
+
+
+## 2026-11-07 帧脚本主动中止
+
+**完成：** SCRIPT-03。`ctx.destroy()` 支持脚本顶层、两个处理方向、注入处理和序列化回调，作用于现有 WS/WSS、检查型 CONNECT／原始 Upgrade 帧管线。调用后通过原有任务回复立即交付终止指令，复用连接已有的双向中止信号；不等剩余 JS、写锁、背压或 Close 回复。普通丢帧和终止用 `ControlFlow` 区分，旧 `FrameScriptStart`／`FrameOutcome` 字段及 `start`／`relay` 签名保留，连接拥有者使用新增 controlled 入口。未新增依赖、HTTP API、存储格式或通用取消层。使用与限制见 [ctx.destroy](RULES.md#ctxdestroy中止当前连接)。
+
+**证据和取舍：** 固定 2.10.13 的前置探针以 26 个场景确认：WS 处理函数调用关闭两端、不发送 Close 帧，前置注入可到达；WS 顶层尚未注册连接，TCP 选项缺少 `reqId`，因此这两类调用无效。whix 按文档定义实现真实关闭，不复制这两个缺口；顶层中止丢弃尚未发出的启动注入，处理函数之前的注入仅做立即可写尝试。后续 JS 仍可运行，但不能撤回关闭；已有脚本预算不变。
+
+**红灯与并发修复：** 旧实现两条真实进程回归均失败，连接保持打开。第一次实现后，独立复核指出仅依赖外层 abort select 会允许另一方向的排队写恢复；新增 WS／TCP 确定性写锁测试，先证明输出 Pending，再从真实 VM 调用 destroy、释放锁，两条均在修复前失败。现在在普通输出 future 每次恢复时检查不可撤回的终止状态，覆盖写锁、背压、扣留和启动注入；终止前置注入走明确的一次 poll 路径。没有增加猜测连接状态的定时器。
+
+| 验证 | 结果 |
+| --- | --- |
+| 新增回归 | 7 条单元测试 + 10 条真实进程测试组：提前答复、JS 后续抛错、取消的排队 VM job、旧结果结构、两协议写锁／背压、四种传输、两个方向、重复调用、前后注入、隐藏、Pause／Ignore、分片／二进制、回调、其他连接隔离、远程来源和未调用的正常控制 |
+| `cargo test --locked --all-targets` | 1327 通过，12 项沿用忽略，无失败 |
+| `cargo test --locked --doc` | 2/2 |
+| 格式、Clippy 全目标 `-D warnings` | 通过 |
+| 前端类型检查／构建，真实代理 Chrome 流量回归 | 通过；浏览器 8/8 |
+| Whistle 2.10.8／2.10.10 常规网络回归 | 各 6/6：`frames` 15、`ws` 6、`tcp-control` 7、`script-sources` 18、`frame-sources` 8、`core` 126；未知差异 0，未扩大既有豁免。这不是旧版本的 destroy 功能对照 |
+| 两版快速门禁 | 各 5/5；规则问题 17462 + 2043，未知差异 0 |
+| 固定 2.10.13 destroy 专项 | 20 个用例、40 项独立预期通过；12 项上游缺口按场景记录，未知差异 0。重新建立隔离状态复放仍通过 |
+| 独立预期负例 | 把两边的 destroy 都替换为无操作后，结果相同、未知差异 0，但 24 项预期失败并退出 1 |
+| 文档链接、diff | 通过 |
+
+专项不把任意网络失败算作关闭：必须已完成握手、两端结束且没有 Close 帧；未读输入导致的 ECONNRESET 与 EOF 均属于中止，原始事件仍保留。首轮专项正是因只认 EOF 和上游 TCP 顶层注入早于 200 而失败；修正夹具后保持严格握手解析，TCP 顶层只向源站注入，避免混入旧有协议错误。保持连接的上游场景必须有后续真实 `LATE` 数据往返，不能只靠短时间没看到 EOF。旧锁定版本没有此 API，专用 bench 对版本不符直接拒绝，不掩盖为通过。
+
+复放入口：Rust 使用 `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`；专项为 `cargo test --locked --lib destroy` 和 `cargo test --locked --test frame_destroy_e2e`。常规网络为 `node tests/differential/run.js network --only frames,ws,tcp-control,script-sources,frame-sources,core`，另一版追加 `--whistle 2.10.10`；快速门禁为 `fast`。浏览器为 `PLAYWRIGHT_CHANNEL=chrome npm --prefix ui-src run test:e2e:traffic`。2.10.13 专项运行方法见[差分说明](../tests/differential/README.md#ctxdestroy-定向对照)。
+
+本地未入库证据：
+
+- 红灯：`target/frame-destroy-red-20261107.log`、`frame-destroy-race-red-verified-20261107.log`；最终 Rust／Clippy／文档测试为 `frame-destroy-all-final-20261107.log`、`frame-destroy-clippy-final-20261107.log`、`frame-destroy-doc-final-20261107.log`；前端为 `frame-destroy-ui-20261107.log`、`frame-destroy-browser-20261107.log`，均在 `target/`。
+- 常规网络：`target/differential/frame-destroy-final-20261107-2.10.8/`、`frame-destroy-final-20261107-2.10.10/`；快速门禁为同目录下的 `frame-destroy-fast-20261107-2.10.8/`、`frame-destroy-fast-20261107-2.10.10/`。
+- 2.10.13 前置探针：`target/frame-destroy-oracle/run-1794023264456/`；最终专项 `final-1794030618829/`、`final-1794030622590/`；无操作负例 `final-1794030626074/`。启动器 `target/frame-destroy-oracle/final-20261107.cjs`，指定 `RS_BIN` 为本次冻结构建；所有 HOME／WHISTLE_PATH／baseDir 均隔离。首轮夹具失败保留在 `final-1794030272770/`，不作为通过证据。
+- 最终普通构建、浏览器和差分二进制 SHA-256：`0e2710f4ce208c02cf3ee659a7867cc10b9055b6cff35b4605fac450c45027b8`。
+
+**未纳入／未验证：** 本地模拟 `statusCode://101` 仍未接入帧脚本，Promise 等其它 JS 差异另行处理。未跑全部 32 个网络阶段、MSRV、跨平台、远端 CI、长期压力或真实外网；不保证中止时已写出的字节可撤回，也不承诺所有前置注入一定送达。没有修改真实代理数据、系统代理、信任库或依赖；只本地提交，不推送。

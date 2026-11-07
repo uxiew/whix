@@ -34,7 +34,10 @@ where
     O: AsyncRead + AsyncWrite + Unpin,
 {
     let started = match script {
-        Some(spec) => FrameScript::start(spec).await,
+        Some(spec) => match FrameScript::start_controlled(spec).await {
+            ControlFlow::Continue(started) => started,
+            ControlFlow::Break(()) => return Ok(()),
+        },
         None => FrameScriptStart::default(),
     };
     let pause = Arc::new(SessionPause::new(flow));
@@ -55,6 +58,7 @@ where
         to_server: tokio::sync::Mutex::new(origin_write),
         to_client: tokio::sync::Mutex::new(client_write),
         script: started.script,
+        signal,
         pause,
         state,
         session,
@@ -69,9 +73,14 @@ where
         tokio::try_join!(pipe.pump(client_read, true), pipe.pump(origin_read, false))?;
         Ok(())
     };
-    tokio::select! {
+    let result = tokio::select! {
         result = relay => result,
         _ = closed.wait_for(|v| *v) => Ok(()),
+    };
+    if pipe.script.as_ref().is_some_and(FrameScript::is_destroyed) {
+        Ok(())
+    } else {
+        result
     }
 }
 
@@ -98,6 +107,7 @@ struct TunnelPipe<S, C> {
     to_server: tokio::sync::Mutex<S>,
     to_client: tokio::sync::Mutex<C>,
     script: Option<FrameScript>,
+    signal: tokio::sync::watch::Sender<bool>,
     pause: Arc<SessionPause>,
     state: Arc<AppState>,
     /// The session the chunks are filed under; `None` for a hidden tunnel,
@@ -118,6 +128,10 @@ where
     }
 
     async fn write_bytes(&self, to_server: bool, data: &[u8]) -> io::Result<()> {
+        write_unless_destroyed(self.script.as_ref(), self.write_raw(to_server, data)).await
+    }
+
+    async fn write_raw(&self, to_server: bool, data: &[u8]) -> io::Result<()> {
         if to_server {
             let mut w = self.to_server.lock().await;
             w.write_all(data).await?;
@@ -220,18 +234,37 @@ where
                 Ok(n) => n,
                 Err(err) => return Err(err),
             };
+            if self.script.as_ref().is_some_and(FrameScript::is_destroyed) {
+                continue;
+            }
             let chunk = &buf[..n];
             let Some(script) = self.script.as_ref().filter(|s| s.handles(to_server)) else {
                 self.transfer(to_server, chunk).await?;
                 continue;
             };
-            let outcome = script
-                .relay(ScriptFrame {
+            let outcome = match script
+                .relay_controlled(ScriptFrame {
                     to_server,
                     data: chunk.to_vec(),
                     binary: true,
                 })
-                .await;
+                .await
+            {
+                ControlFlow::Continue(outcome) => outcome,
+                ControlFlow::Break(sent) => {
+                    write_before_abort(async {
+                        for frame in &sent {
+                            if self.write_raw(frame.to_server, &frame.data).await.is_err() {
+                                break;
+                            }
+                            self.record(frame.to_server, &frame.data, false, false);
+                        }
+                    })
+                    .await;
+                    self.signal.send_replace(true);
+                    return Ok(());
+                }
+            };
             for sent in &outcome.sent {
                 self.write(sent.to_server, &sent.data).await?;
             }
@@ -243,3 +276,7 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/tcp_destroy_cases.rs"]
+mod destroy_cases;
