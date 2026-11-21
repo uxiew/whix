@@ -2,6 +2,8 @@
 
 第一次用，先看仓库首页的 [README](../README.md)：whix 是什么、能做什么、五分钟上手。
 
+云端模型继续开发，先读 [AGENTS](../AGENTS.md) → [HANDOFF](HANDOFF.md) → [当前待办](ROADMAP.md#当前待办)。项目当前名为 whix；9 月审查是历史材料。
+
 ## 用它
 
 | 文档 | 什么时候看 |
@@ -26,8 +28,10 @@
 
 ## 项目状态
 
-- [STATUS.md](STATUS.md)：每项任务测了什么、结果是多少、还有什么没验证，每条带日期和提交号。
-- [ROADMAP.md](ROADMAP.md)：唯一的任务计划。
+- [STATUS.md](STATUS.md)：顶部是当前快照，下方是带日期和提交号的历史证据；旧数字不能代替当前复验。
+- [ROADMAP.md](ROADMAP.md)：唯一的任务计划；先看「当前待办」，已完成里程碑保持关闭。
+- [HANDOFF.md](HANDOFF.md)：云端初始化、文件归属、分层验证、提交与接收。
+- [2026-09-30 核心审查](audits/whistle-core-parity-audit-2026-09-30.md)：原始报告归档；其中 CORE 问题后续已有实施。
 - [ROADMAP-HISTORY.md](ROADMAP-HISTORY.md)：早期的调查记录，只留作历史。里面的勾选、计数、"全绿"都是当时的，不代表现在。
 
 许可与来源见仓库根目录的 [LICENSE](../LICENSE) 和 [NOTICE.md](../NOTICE.md)。文档和代码对不上时，以代码和测试为准，再回来改文档。

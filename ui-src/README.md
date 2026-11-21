@@ -40,9 +40,13 @@ npm run test:e2e
 PLAYWRIGHT_CHANNEL=chrome npm run test:e2e
 ```
 
+Linux 首次运行还需要 Chromium 的系统库。专用云端/CI 环境已有系统依赖安装权限时，在本目录使用 `npx --no-install playwright install --with-deps chromium`；没有该权限时使用预装依赖的环境，或记录浏览器门禁受阻。`install chromium` 只下载浏览器，不能替代系统库安装。
+
 `test:e2e` 自行启动并停止 `127.0.0.1:25199` 上的 Vite；端口被占用就失败，不接管已有服务。每条测试的 API 数据独立，不改真实代理规则，也不共用开发 mock 的写入状态。测试操作真实 Vue／CodeMirror，覆盖草稿切换、请求乱序、保存失败与重试、保存期间继续编辑、重复保存、重命名／删除和关闭提醒；这套不是 Rust 后端端到端验收。失败截图和 trace 在 `test-results/`。
 
-`npm run test:e2e:proxy` 则先构建前端和 Rust，再在 `127.0.0.1:25198` 启动真实 whix，使用它嵌入的生产控制台，验证配置预览／确认、覆盖、排序、草稿和真实代理响应。它只用自己新建的临时数据目录，不读取 `~/.whix`，结束后停止代理并清理该临时目录。已有 Chrome 时同样可加 `PLAYWRIGHT_CHANNEL=chrome`。CI 的 Node 24 控制台任务运行两套测试并归档失败证据。配置合并规则只在 Rust 实现，开发 mock 的新导入接口会明确报出需要真实代理，不另维护一份假合并算法。
+`npm run test:e2e:proxy` 则先构建前端和 Rust，再在 `127.0.0.1:25198` 启动真实 whix，使用它嵌入的生产控制台，验证配置预览／确认、覆盖、排序、草稿和真实代理响应。它只用自己新建的临时数据目录，不读取 `~/.whix`，结束后停止代理并清理该临时目录。已有 Chrome 时同样可加 `PLAYWRIGHT_CHANNEL=chrome`。配置合并规则只在 Rust 实现，开发 mock 的新导入接口会明确报出需要真实代理，不另维护一份假合并算法。
+
+`npm run test:e2e:traffic` 覆盖真实代理上的 Composer、二进制重放、HAR 导入及 WebSocket/TCP 调试控制，先构建 UI 与 Rust。测试使用回环代理 `25198` 与本地源站 `25197`，数据与浏览器配置隔离；不要并行运行它与 `test:e2e:proxy`。同样支持 `PLAYWRIGHT_CHANNEL=chrome`。CI 的 Node 24 控制台任务顺序运行三套测试并归档失败证据。
 
 Rules 每个组、Values 每个名称及“All values”各有独立草稿，切组、切页和刷新接口不会覆盖未保存文本；保存确认的是点击保存时的快照，之后继续输入的内容仍显示 `Unsaved changes`。草稿只保存在当前页面内存，不写 `localStorage`；刷新／关闭时浏览器会提示，确认离开就会丢弃未保存内容。它不合并其他窗口的修改，“All values”保存仍是整份替换。
 

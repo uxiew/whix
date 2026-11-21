@@ -55,7 +55,7 @@ node tests/differential/run.js fast   # 需先在 tests/differential 里 npm ci
 git diff --check
 ```
 
-改动控制台编辑流程时还须运行 `npm run test:e2e --prefix ui-src`；配置迁移与规则组管理另跑 `npm run test:e2e:proxy --prefix ui-src`，后者会构建并使用真实 Rust 代理。浏览器安装、隔离方式与覆盖边界见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
+改动控制台编辑流程运行 `npm run test:e2e --prefix ui-src`；配置迁移与规则组管理运行 `npm run test:e2e:proxy --prefix ui-src`；Composer、二进制重放、HAR 导入、WebSocket/TCP 控制运行 `npm run test:e2e:traffic --prefix ui-src`。后两套会先构建 UI 与 Rust，并使用真实代理；三套顺序执行，不能并行占用同一端口。浏览器安装、隔离与覆盖范围见[控制台的浏览器回归](../ui-src/README.md#浏览器回归)。
 
 在 `rust-toolchain.toml` 钉住的工具链上，这些命令都应通过；任何一条失败都算门禁失败，不要用全局 `allow` 或降低 lint 级别绕过。最近一次实测的提交、环境和计数只记在 [STATUS](STATUS.md)，手册里不抄数字。普通测试不会执行 `#[ignore]` 基准；`--all-targets` 也不能替代单独的 doc tests。
 
@@ -81,7 +81,7 @@ node scripts\smoke.mjs target\release\whix.exe --console built      # Windows
 node scripts/smoke.mjs <二进制> --json smoke.json --keep                    # 另存报告，留下数据目录
 ```
 
-本机约 4 秒，把一个人会做的事按顺序做一遍，29 步（Windows 24 步，其中 1 步跳过），每步一行 `ok`/`FAIL`/`skip`，全部通过退出码 0，有失败 1，参数不对 2：
+脚本用本地夹具依次完成启动、配置、代理流量、重启与插件生命周期检查；当前步骤数和耗时以实际输出为准。每步一行 `ok`/`FAIL`/`skip`，全部通过退出码 0，有失败为 1，参数不对为 2：
 
 1. 在全新目录上启动，确认生成了根证书，控制台页面是 `ui-src/dist` 那一版（`--console built`；`placeholder` 要求占位页，默认 `any` 不管）。
 2. 通过 API 改规则、设一个 Value；HTTP、HTTPS（拦截，客户端只信任刚生成的 CA）、WebSocket、TLS 里的 WebSocket、一个 `--node-plugin` 插件，各经代理发一次，确认规则和 Value 都生效，控制台列出了这些请求。
@@ -99,7 +99,7 @@ node scripts/smoke.mjs <二进制> --json smoke.json --keep                    #
 cargo build --locked              # 仓库根目录；比源码旧的二进制会被拒绝
 cd tests/differential
 npm ci                            # 按锁文件装 whistle 2.10.8 全套依赖；不要用 npm install
-node run.js fast                  # 约 5 秒：规则解析差分（文档语料 + 手写语料）和二维码，不开端口代理
+node run.js fast                  # 5 阶段：时钟断言、两套解析语料、二维码、配置迁移
 node run.js network               # 约 18 分钟（2026-09-29 本机 `all` 实测 1093 秒）：两边代理都起来，所有语料、专项 bench 和上游自带测试
 node run.js network --only cases-delete,https   # 只跑几步；--list 列出全部步骤
 ```
@@ -146,7 +146,7 @@ RTT_MS=20 node perf-bench.js         # 源站前面加 20 ms 往返时延
 
 ## 变更交接
 
-先记录 git 状态和既有未提交内容；不要覆盖用户的 `_original/` 或其他工作。规则变更同时更新最小反例、差分语料和对应手册；行为变化写入 STATUS 的下一次快照。每次验收关联具体提交/制品与命令，标明 skipped/未运行项，禁止从历史路线图复制“全绿”。
+跨模型接手先看 [HANDOFF](HANDOFF.md)，当前任务只从 [ROADMAP](ROADMAP.md#当前待办) 选择。先记录 git 状态和既有未提交内容；不要覆盖用户的 `_original/` 或其他工作。规则变更同时更新最小反例、差分语料和对应手册；行为变化写入 STATUS 的下一次快照。每次验收关联具体提交/制品与命令，标明 skipped/未运行项，禁止从历史路线图复制“全绿”。
 
 文档分层保持稳定：根 README 是入口，操作细节放本文/OPERATIONS/参考手册，当前状态放 STATUS，活动任务放 ROADMAP，过程证据放历史记录。
 
