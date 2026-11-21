@@ -117,3 +117,15 @@ node scripts/smoke.mjs target/release/whix --console built
 `main` push / PR 触发主 CI；完整双版本网络差分是独立的手动/每周任务。CI 构建产物保留 14 天，流程不会自动创建 GitHub Release，也不会部署代理服务。
 
 接收方必须核对远端实际提交与 CI 结果；无法运行的门禁写「受阻」或「未验证」。Git 推送成功、测试通过、正式发布是三个不同结果。
+
+本轮的交付阻塞见 [STATUS](STATUS.md#2026-11-21-云端交接整理)。网络恢复后，在含完整本地提交的仓库执行：
+
+```sh
+git fetch --no-tags origin
+git log --left-right --oneline HEAD...origin/main
+git push origin main
+git rev-parse HEAD
+git ls-remote origin refs/heads/main
+```
+
+先确认远端没有需要处理的新提交，再执行 push；不得强推。最后两条输出的提交号应一致，之后云端再检出。修复网络不需要改变仓库锁文件或关闭 TLS 校验；先前一次连接成功不能视为持续可用。
